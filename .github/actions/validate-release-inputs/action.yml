@@ -1,0 +1,50 @@
+name: Validate container release inputs
+description: Validates the reusable workflow contract before any registry login or build
+inputs:
+  image:
+    required: true
+  context:
+    required: true
+  dockerfile:
+    required: true
+  platforms:
+    required: true
+  build-args-json:
+    required: true
+  runner:
+    required: true
+  sha:
+    required: true
+outputs:
+  image:
+    value: ${{ steps.validate.outputs.image }}
+  context:
+    value: ${{ steps.validate.outputs.context }}
+  dockerfile:
+    value: ${{ steps.validate.outputs.dockerfile }}
+  platforms:
+    value: ${{ steps.validate.outputs.platforms }}
+  runner:
+    value: ${{ steps.validate.outputs.runner }}
+  short-sha:
+    value: ${{ steps.validate.outputs.short_sha }}
+  build-args:
+    value: ${{ steps.validate.outputs.build_args }}
+runs:
+  using: composite
+  steps:
+    - id: validate
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_CONTEXT: ${{ inputs.context }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
+        INPUT_BUILD_ARGS_JSON: ${{ inputs.build-args-json }}
+        INPUT_RUNNER: ${{ inputs.runner }}
+        INPUT_SHA: ${{ inputs.sha }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/../../../scripts/validate_inputs.py" <<EOF
+        $(python3 -c 'import json, os; print(json.dumps({"image": os.environ["INPUT_IMAGE"], "context": os.environ["INPUT_CONTEXT"], "dockerfile": os.environ["INPUT_DOCKERFILE"], "platforms": os.environ["INPUT_PLATFORMS"], "build_args_json": os.environ["INPUT_BUILD_ARGS_JSON"], "runner": os.environ["INPUT_RUNNER"], "sha": os.environ["INPUT_SHA"]}))')
+        EOF
