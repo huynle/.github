@@ -48,10 +48,10 @@ on:
         value: ${{ jobs.release.outputs.digest }}
       git-tag:
         description: Sortable immutable release tag
-        value: ${{ jobs.release.outputs.git-tag }}
+        value: ${{ jobs.release.outputs['git-tag'] }}
       sha-tag:
         description: Full source identity tag
-        value: ${{ jobs.release.outputs.sha-tag }}
+        value: ${{ jobs.release.outputs['sha-tag'] }}
 
 permissions:
   contents: read
@@ -177,7 +177,7 @@ jobs:
         id: release
         shell: bash
         env:
-          SHORT_SHA: ${{ steps.validate.outputs.short-sha }}
+          SHORT_SHA: ${{ steps.validate.outputs.short_sha }}
           FULL_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -222,7 +222,7 @@ jobs:
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
-          build-args: ${{ steps.validate.outputs.build-args }}
+          build-args: ${{ steps.validate.outputs.build_args }}
           provenance: ${{ inputs.provenance }}
           sbom: ${{ inputs.sbom }}
 
