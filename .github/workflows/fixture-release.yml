@@ -1,0 +1,22 @@
+name: Release workflow fixture
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+      - name: Build fixture before release
+        run: docker build --file fixture/app/Dockerfile fixture/app
+  release:
+    needs: test
+    uses: ./.github/workflows/container-release.yml
+    with:
+      image: ghcr.io/huynle/container-release-fixture
+      context: fixture/app
+      dockerfile: fixture/app/Dockerfile
+      runner: ubuntu-latest
+      build-args-json: '{"FIXTURE":"true"}'

@@ -1,0 +1,171 @@
+name: Container release v1
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Lowercase GHCR image path (for example ghcr.io/huynle/app)
+        required: true
+        type: string
+      context:
+        description: Repository-relative build context
+        required: false
+        default: .
+        type: string
+      dockerfile:
+        description: Repository-relative Dockerfile path
+        required: false
+        default: Dockerfile
+        type: string
+      platforms:
+        description: Comma-separated linux/amd64 and/or linux/arm64
+        required: false
+        default: linux/amd64
+        type: string
+      build-args-json:
+        description: JSON object of non-secret build arguments
+        required: false
+        default: '{}'
+        type: string
+      runner:
+        description: self-hosted (default) or ubuntu-latest
+        required: false
+        default: self-hosted
+        type: string
+      provenance:
+        description: Publish BuildKit provenance attestation
+        required: false
+        default: true
+        type: boolean
+      sbom:
+        description: Publish BuildKit SBOM attestation
+        required: false
+        default: true
+        type: boolean
+    outputs:
+      digest:
+        description: Published image digest
+        value: ${{ jobs.release.outputs.digest }}
+      git-tag:
+        description: Sortable immutable release tag
+        value: ${{ jobs.release.outputs.git-tag }}
+      sha-tag:
+        description: Full source identity tag
+        value: ${{ jobs.release.outputs.sha-tag }}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate, build, and publish
+    runs-on: ${{ fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || '["self-hosted","amos"]') }}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      git-tag: ${{ steps.release.outputs.git_tag }}
+      sha-tag: ${{ steps.release.outputs.sha_tag }}
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+
+      - name: Check out release validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          repository: huynle/.github
+          ref: ${{ github.workflow_sha }}
+          path: .container-release
+          persist-credentials: false
+
+      - name: Validate release inputs
+        id: validate
+        uses: ./.container-release/.github/actions/validate-release-inputs
+        with:
+          image: ${{ inputs.image }}
+          context: ${{ inputs.context }}
+          dockerfile: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          build-args-json: ${{ inputs.build-args-json }}
+          runner: ${{ inputs.runner }}
+          sha: ${{ github.sha }}
+
+      - name: Create immutable release identity
+        id: release
+        shell: bash
+        env:
+          SHORT_SHA: ${{ steps.validate.outputs.short-sha }}
+          FULL_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          timestamp="$(date -u +'%Y%m%d%H%M%S')"
+          echo "git_tag=git-${timestamp}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${FULL_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: contains(steps.validate.outputs.platforms, ',') || steps.validate.outputs.platforms == 'linux/arm64'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.11.1
+
+      - name: Log in to GHCR with caller token
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate OCI metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.8.0
+        with:
+          images: ${{ steps.validate.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.release.outputs.git_tag }}
+            type=raw,value=${{ steps.release.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.git_tag }}
+
+      - name: Build and push immutable image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
+        with:
+          context: ${{ steps.validate.outputs.context }}
+          file: ${{ steps.validate.outputs.dockerfile }}
+          platforms: ${{ steps.validate.outputs.platforms }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: ${{ steps.validate.outputs.build-args }}
+          provenance: ${{ inputs.provenance }}
+          sbom: ${{ inputs.sbom }}
+
+      - name: Publish release summary
+        if: success()
+        shell: bash
+        env:
+          IMAGE: ${{ steps.validate.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          GIT_TAG: ${{ steps.release.outputs.git_tag }}
+          SHA_TAG: ${{ steps.release.outputs.sha_tag }}
+          PROVENANCE: ${{ inputs.provenance }}
+          SBOM: ${{ inputs.sbom }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Container release
+
+          | Field | Value |
+          | --- | --- |
+          | Image | \`${IMAGE}\` |
+          | Digest | \`${DIGEST}\` |
+          | Promotion tag | \`${GIT_TAG}\` |
+          | Source tag | \`${SHA_TAG}\` |
+          | Provenance | \`${PROVENANCE}\` |
+          | SBOM | \`${SBOM}\` |
+          EOF
