@@ -1,4 +1,5 @@
-import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -6,28 +7,36 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VALIDATOR = ROOT / "scripts" / "validate_inputs.py"
+WORKFLOW = (ROOT / ".github/workflows/container-release.yml").read_text()
+
+
+def inline_validator():
+    match = re.search(r"python3 - <<'PY'\n(?P<body>.*?)\n\s+PY$", WORKFLOW, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise AssertionError("inline validator heredoc not found")
+    lines = match.group("body").splitlines()
+    indentation = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+    return "\n".join(line[indentation:] for line in lines) + "\n"
 
 
 def run_validator(**overrides):
     payload = {
-        "image": "ghcr.io/huynle/example-app",
-        "context": ".",
-        "dockerfile": "Dockerfile",
-        "platforms": "linux/amd64",
-        "build_args_json": '{"APP_ENV":"production","REVISION":"abc-123"}',
-        "runner": "self-hosted",
-        "sha": "0123456789abcdef0123456789abcdef01234567",
+        "INPUT_IMAGE": "ghcr.io/huynle/example-app",
+        "INPUT_CONTEXT": ".",
+        "INPUT_DOCKERFILE": "Dockerfile",
+        "INPUT_PLATFORMS": "linux/amd64",
+        "INPUT_BUILD_ARGS_JSON": '{"APP_ENV":"production","REVISION":"abc-123"}',
+        "INPUT_RUNNER": "self-hosted",
+        "INPUT_SHA": "0123456789abcdef0123456789abcdef01234567",
     }
-    payload.update(overrides)
+    payload.update({f"INPUT_{key.upper()}": value for key, value in overrides.items()})
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "output"
         result = subprocess.run(
-            [sys.executable, str(VALIDATOR)],
-            input=json.dumps(payload),
+            [sys.executable, "-c", inline_validator()],
             text=True,
             capture_output=True,
-            env={"GITHUB_OUTPUT": str(output)},
+            env={**os.environ, **payload, "GITHUB_OUTPUT": str(output)},
         )
         values = output.read_text() if output.exists() else ""
     return result, values

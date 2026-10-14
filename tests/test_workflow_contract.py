@@ -37,6 +37,15 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("packages: write", WORKFLOW)
         self.assertIn("contents: read", WORKFLOW)
 
+    def test_external_call_does_not_checkout_validator_at_caller_sha(self):
+        """Reusable-call github.workflow_sha belongs to the caller repository."""
+        self.assertNotIn("github.workflow_sha", WORKFLOW)
+        self.assertNotIn("repository: huynle/.github", WORKFLOW)
+        self.assertNotIn("Check out release validator", WORKFLOW)
+        self.assertEqual(WORKFLOW.count("actions/checkout@"), 1)
+        self.assertIn("name: Validate release inputs", WORKFLOW)
+        self.assertIn("python3 - <<'PY'", WORKFLOW)
+
     def test_fixture_releases_only_after_test(self):
         self.assertIn("needs: test", FIXTURE)
         self.assertIn("@v1", FIXTURE)

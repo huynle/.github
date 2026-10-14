@@ -38,6 +38,8 @@ The caller must grant `contents: read` and `packages: write`. No PAT, deploy key
 
 Inputs are typed by `workflow_call` and validated before registry login:
 
+The validator is inline in the reusable workflow. This is intentional: in an external reusable call, caller-scoped SHA contexts identify the caller repository, not `huynle/.github`. Keeping validation in the workflow selected by `@v1` avoids a second checkout and ensures validation changes follow the same reviewed version boundary as the release contract.
+
 | Input | Type | Default | Rules |
 | --- | --- | --- | --- |
 | `image` | string | required | Lowercase `ghcr.io/...` path |
