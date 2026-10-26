@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
       - name: Run contract and negative-input tests
-        run: python3 -m unittest discover -s tests -v
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+          python3 -m unittest discover -s tests -v
       - name: Run yamllint
         run: |
           python3 -m pip install --disable-pip-version-check yamllint==1.37.1
