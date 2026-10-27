@@ -47,6 +47,29 @@ def run_validator(**overrides):
 
 
 class FleetBundlesWorkflowTests(unittest.TestCase):
+    def test_publish_checks_out_reviewed_verifier_before_building_it(self):
+        steps = JOBS["publish"]["steps"]
+        checkout_index = next(i for i, item in enumerate(steps) if item.get("name") == "Check out reviewed fleet verifier")
+        install_index = next(i for i, item in enumerate(steps) if item.get("name") == "Install tools")
+        self.assertLess(checkout_index, install_index)
+        checkout = steps[checkout_index]
+        self.assertRegex(checkout["uses"], r"^actions/checkout@[0-9a-f]{40}$")
+        self.assertEqual(checkout["with"]["repository"], "huynle/fleet")
+        self.assertEqual(checkout["with"]["ref"], "${{ env.FLEET_VERIFIER_REF }}")
+        self.assertEqual(checkout["with"]["path"], ".fleet-verifier")
+        self.assertEqual(checkout["with"]["persist-credentials"], "false")
+        self.assertIn("./.fleet-verifier/cmd/fleet-bundle", steps[install_index]["run"])
+
+    def test_registry_step_has_every_required_input_environment_variable(self):
+        push = step("publish", "Push to the registry")
+        self.assertEqual(push["env"]["FLEET_DIR"], "${{ inputs.fleet-dir }}")
+        required = set(re.findall(r'\$\{?([A-Z][A-Z0-9_]*)\}?', push["run"]))
+        shell_locals = {"ref", "output", "error", "target", "os", "arch", "repo", "roots", "pub", "dir",
+                        "machine", "digest", "current", "state", "signed_sequence", "signed_digest", "at",
+                        "cur", "current_digest"}
+        provided = set(push.get("env", {})) | {"RUNNER_TEMP", "PATH"} | {name.upper() for name in shell_locals}
+        self.assertEqual(required - provided, set(), f"unset variables in push script: {required - provided}")
+
     def test_only_callable_as_reusable_workflow(self):
         self.assertEqual(list(WORKFLOW["on"]), ["workflow_call"])
         self.assertEqual(WORKFLOW["on"]["workflow_call"]["inputs"]["tenant"]["required"], "true")
