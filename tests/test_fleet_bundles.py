@@ -60,7 +60,12 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
     def test_minimal_permissions(self):
         self.assertEqual(WORKFLOW["permissions"], {"contents": "read"})
         for name, job in JOBS.items():
-            expected = {"contents": "read", "packages": "write"} if name == "publish" else {"contents": "read"}
+            if name == "publish":
+                expected = {"contents": "read", "packages": "write"}
+            elif name == "plan":
+                expected = {"contents": "read", "packages": "read"}
+            else:
+                expected = {"contents": "read"}
             self.assertEqual(job.get("permissions"), expected, name)
 
     def test_signing_key_only_in_publish_job_on_main_push(self):
@@ -76,7 +81,7 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request", condition)
 
     def test_publish_skips_cleanly_without_key(self):
-        check = step("publish", "Check for the signing key")
+        check = step("publish", "Prepare signing key")
         self.assertIn("present=false", check["run"])
         self.assertIn("::notice::", check["run"])
         for candidate in JOBS["publish"]["steps"][1:]:
@@ -103,14 +108,45 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
 
     def test_registry_tags_follow_the_contract(self):
         script = step("publish", "Push to the registry")["run"]
-        self.assertIn('ref="$REGISTRY:$TENANT-$machine-$SEQUENCE"', script)
-        self.assertIn('"$TENANT-$machine-current"', script)
+        self.assertIn('repo="$REGISTRY/$TENANT"', script)
+        self.assertIn('ref="$repo:$machine-$SEQUENCE"', script)
+        self.assertIn('"$machine-current"', script)
         self.assertIn('[ "$at" -lt "$SEQUENCE" ]', script)
         self.assertIn("refusing to overwrite", script)
         for media_type in ("application/vnd.huynle.fleet.bundle.v1.tar+zstd",
                            "application/vnd.huynle.fleet.bundle.manifest.v1+json",
                            "application/vnd.huynle.fleet.minisig.v1"):
             self.assertIn(media_type, script)
+
+    def test_publish_registry_errors_are_not_treated_as_missing(self):
+        script = step("publish", "Push to the registry")["run"]
+        self.assertIn("fetch_manifest", script)
+        for marker in ("MANIFEST_UNKNOWN", "NAME_UNKNOWN", "404"):
+            self.assertIn(marker, script)
+        self.assertIn("return 2", script)
+        self.assertNotIn('oras manifest fetch "$ref" 2>/dev/null', script)
+
+    def test_signing_secret_is_only_written_to_a_mode_0600_temp_file(self):
+        publish = JOBS["publish"]
+        secret_steps = [candidate for candidate in publish["steps"] if "FLEET_SIGNING_KEY" in yaml.safe_dump(candidate)]
+        self.assertEqual([candidate["name"] for candidate in secret_steps], ["Prepare signing key"])
+        prepare = secret_steps[0]
+        self.assertIn("umask 077", prepare["run"])
+        self.assertIn("trap", prepare["run"])
+        self.assertIn("chmod 600", prepare["run"])
+        self.assertNotIn("FLEET_SIGNING_KEY", step("publish", "Sign, pack and verify").get("env", {}))
+
+    def test_publish_concurrency_never_cancels_an_in_progress_publish(self):
+        concurrency = JOBS["publish"]["concurrency"]
+        self.assertEqual(concurrency["cancel-in-progress"], "false")
+        self.assertIn("publish", concurrency["group"])
+
+    def test_main_plan_compares_each_machine_with_its_last_published_commit(self):
+        script = step("plan", "Find affected machines")["run"]
+        self.assertIn("org.opencontainers.image.revision", script)
+        self.assertIn("machine-current", script)
+        self.assertIn('"./$AFFECTED"', script)
+        self.assertNotIn('push) base="$PUSH_BEFORE"', script)
 
     def test_oras_download_is_checksummed(self):
         script = step("publish", "Install tools")["run"]

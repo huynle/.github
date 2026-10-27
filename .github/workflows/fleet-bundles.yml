@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
     outputs:
       machines: ${{ steps.affected.outputs.machines }}
       sequence: ${{ steps.affected.outputs.sequence }}
@@ -116,7 +117,15 @@ jobs:
           PY
 
       - name: Install renderer dependencies
-        run: pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
+        run: |
+          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
+          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
 
       - name: Find affected machines
         id: affected
@@ -128,15 +137,41 @@ jobs:
           FLEET_DIR: ${{ inputs.fleet-dir }}
           AFFECTED: ${{ inputs.affected }}
           RENDER: ${{ inputs.render }}
+          TENANT: ${{ inputs.tenant }}
+          REGISTRY: ${{ steps.validate.outputs.registry }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          base=""
-          case "$EVENT" in
-            pull_request) base="$PR_BASE" ;;
-            push) base="$PUSH_BEFORE" ;;
-          esac
-          if [ -n "$base" ]; then
-            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$base" --json)"
+          if [ "$EVENT" = pull_request ]; then
+            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$PR_BASE" --json)"
+          elif [ "$EVENT" = push ]; then
+            # Compare every machine with what was last ACTUALLY published. A cancelled or failed earlier run
+            # therefore remains eligible on the next main push instead of being lost behind event.before.
+            printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
+            repo="$REGISTRY/$TENANT"
+            selected='[]'
+            for machine in $("./$AFFECTED" --fleet "$FLEET_DIR" --all --json | jq -r '.[]'); do
+              ref="$repo:$machine-current"
+              if manifest="$(oras manifest fetch "$ref" 2>"$RUNNER_TEMP/fetch.err")"; then
+                base="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<<"$manifest")"
+                if [ -z "$base" ]; then
+                  echo "::error::$ref has no org.opencontainers.image.revision annotation"
+                  exit 1
+                fi
+                changed="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$base" --json)"
+                if jq -e --arg machine "$machine" 'index($machine) != null' <<<"$changed" >/dev/null; then
+                  selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
+                fi
+              elif grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)' "$RUNNER_TEMP/fetch.err"; then
+                selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
+              else
+                cat "$RUNNER_TEMP/fetch.err" >&2
+                exit 2
+              fi
+            done
+            oras logout ghcr.io
+            machines="$selected"
           else
             machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --all --json)"
           fi
@@ -270,16 +305,22 @@ jobs:
       group: fleet-bundles-publish-${{ github.repository }}
       cancel-in-progress: false
     steps:
-      - name: Check for the signing key
+      - name: Prepare signing key
         id: key
         shell: bash
         env:
           FLEET_SIGNING_KEY: ${{ secrets.FLEET_SIGNING_KEY }}
         run: |
+          set -euo pipefail
           if [ -z "$FLEET_SIGNING_KEY" ]; then
             echo "::notice::FLEET_SIGNING_KEY is not set in environment fleet-signing; bundles are not signed or pushed (docs/runbooks/fleet.md)."
             echo "present=false" >>"$GITHUB_OUTPUT"
           else
+            key="$RUNNER_TEMP/signing.key"
+            trap 'rm -f "$key"' EXIT
+            umask 077
+            printf '%s\n' "$FLEET_SIGNING_KEY" >"$key"
+            chmod 600 "$key"
             echo "present=true" >>"$GITHUB_OUTPUT"
           fi
 
@@ -315,7 +356,6 @@ jobs:
         if: steps.key.outputs.present == 'true'
         shell: bash
         env:
-          FLEET_SIGNING_KEY: ${{ secrets.FLEET_SIGNING_KEY }}
           TENANT: ${{ inputs.tenant }}
           FLEET_DIR: ${{ inputs.fleet-dir }}
           RENDER: ${{ inputs.render }}
@@ -330,8 +370,6 @@ jobs:
             exit 1
           fi
           key="$RUNNER_TEMP/signing.key"
-          trap 'rm -f "$key"' EXIT
-          (umask 077 && printf '%s\n' "$FLEET_SIGNING_KEY" >"$key")
           for dir in "$RUNNER_TEMP"/bundles/*/; do
             "./$RENDER" sign "$dir" --key "$key"
           done
@@ -359,20 +397,35 @@ jobs:
           REVISION: ${{ github.sha }}
         run: |
           set -euo pipefail
+          fetch_manifest() {
+            local ref="$1" output="$2" error="$3"
+            if oras manifest fetch "$ref" >"$output" 2>"$error"; then
+              return 0
+            fi
+            if grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)' "$error"; then
+              return 1
+            fi
+            cat "$error" >&2
+            return 2
+          }
           printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
+          repo="$REGISTRY/$TENANT"
           for dir in "$RUNNER_TEMP"/packed/*/; do
             machine="$(basename "$dir")"
             digest="$(sha256sum "$dir/manifest.json" | cut -d' ' -f1)"
-            ref="$REGISTRY:$TENANT-$machine-$SEQUENCE"
-            current="$REGISTRY:$TENANT-$machine-current"
-            if existing="$(oras manifest fetch "$ref" 2>/dev/null)"; then
+            ref="$repo:$machine-$SEQUENCE"
+            current="$repo:$machine-current"
+            state=0
+            fetch_manifest "$ref" "$RUNNER_TEMP/existing.json" "$RUNNER_TEMP/fetch.err" || state=$?
+            if [ "$state" = 0 ]; then
+              existing="$(cat "$RUNNER_TEMP/existing.json")"
               # Same sequence: allowed only for the byte-identical signed manifest (contract section 4).
               if [ "$(jq -r '.annotations["org.huynle.fleet.manifest-sha256"] // ""' <<<"$existing")" != "$digest" ]; then
                 echo "::error::$ref exists with a different signed manifest; refusing to overwrite"
                 exit 1
               fi
               echo "$ref already holds this bundle"
-            else
+            elif [ "$state" = 1 ]; then
               (
                 cd "$dir"
                 oras push "$ref" \
@@ -389,14 +442,17 @@ jobs:
                   tenant-key-cert.json:application/vnd.huynle.fleet.tenant-key-cert.v1+json \
                   tenant-key-cert.json.minisig:application/vnd.huynle.fleet.minisig.v1
               )
-            fi
+            else exit "$state"; fi
             # Move <tenant>-<machine>-current forward only: an older run finishing late never moves it back.
             at=0
-            if cur="$(oras manifest fetch "$current" 2>/dev/null)"; then
+            state=0
+            fetch_manifest "$current" "$RUNNER_TEMP/current.json" "$RUNNER_TEMP/fetch.err" || state=$?
+            if [ "$state" = 0 ]; then
+              cur="$(cat "$RUNNER_TEMP/current.json")"
               at="$(jq -r '.annotations["org.huynle.fleet.sequence"] // "0"' <<<"$cur")"
-            fi
+            elif [ "$state" != 1 ]; then exit "$state"; fi
             if [ "$at" -lt "$SEQUENCE" ]; then
-              oras tag "$ref" "$TENANT-$machine-current"
+              oras tag "$ref" "$machine-current"
               echo "$current -> sequence $SEQUENCE"
             else
               echo "::notice::$current already at sequence $at (>= $SEQUENCE); not moved"
