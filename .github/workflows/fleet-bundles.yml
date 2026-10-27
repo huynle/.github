@@ -163,7 +163,7 @@ jobs:
                 if jq -e --arg machine "$machine" 'index($machine) != null' <<<"$changed" >/dev/null; then
                   selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
                 fi
-              elif grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)' "$RUNNER_TEMP/fetch.err"; then
+              elif grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)|: not found$' "$RUNNER_TEMP/fetch.err"; then
                 selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
               else
                 cat "$RUNNER_TEMP/fetch.err" >&2
@@ -392,7 +392,7 @@ jobs:
             if oras manifest fetch "$ref" >"$output" 2>"$error"; then
               return 0
             fi
-            if grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)' "$error"; then
+            if grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)|: not found$' "$error"; then
               return 1
             fi
             cat "$error" >&2
