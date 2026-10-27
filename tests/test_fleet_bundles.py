@@ -142,10 +142,31 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
 
     def test_main_plan_compares_each_machine_with_its_last_published_commit(self):
         script = step("plan", "Find affected machines")["run"]
-        self.assertIn("org.opencontainers.image.revision", script)
         self.assertIn("machine-current", script)
         self.assertIn('"./$AFFECTED"', script)
         self.assertNotIn('push) base="$PUSH_BEFORE"', script)
+        self.assertIn('fleet-bundle verify', script)
+        self.assertIn('jq -r .source.commit', script)
+        self.assertIn('jq -r .sequence', script)
+        self.assertIn('oras pull', script)
+        self.assertNotRegex(script, r'base=.*org\.opencontainers\.image\.revision')
+
+    def test_registry_freshness_uses_signed_manifest_not_annotations(self):
+        plan = step("plan", "Find affected machines")["run"]
+        publish = step("publish", "Push to the registry")["run"]
+        for script in (plan, publish):
+            self.assertIn("fleet-bundle verify", script)
+            self.assertIn("manifest.json", script)
+        self.assertIn('signed_sequence="$(jq -r .sequence', publish)
+        self.assertIn('signed_digest="$(sha256sum', publish)
+        self.assertNotRegex(publish, r'at=.*annotations\["org\.huynle\.fleet\.sequence"\]')
+        self.assertNotRegex(publish, r'existing.*annotations\["org\.huynle\.fleet\.manifest-sha256"\]')
+
+    def test_pr_planning_does_not_access_registry_or_secrets(self):
+        script = step("plan", "Find affected machines")["run"]
+        pr_branch = script.split('elif [ "$EVENT" = push ]', 1)[0]
+        self.assertNotIn("oras ", pr_branch)
+        self.assertNotIn("GITHUB_TOKEN", pr_branch)
 
     def test_oras_download_is_checksummed(self):
         script = step("publish", "Install tools")["run"]
