@@ -81,11 +81,10 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request", condition)
 
     def test_publish_skips_cleanly_without_key(self):
-        check = step("publish", "Prepare signing key")
-        self.assertIn("present=false", check["run"])
+        check = step("publish", "Sign, pack and verify")
+        self.assertIn("ready=false", check["run"])
         self.assertIn("::notice::", check["run"])
-        for candidate in JOBS["publish"]["steps"][1:]:
-            self.assertEqual(candidate.get("if"), "steps.key.outputs.present == 'true'", candidate.get("name"))
+        self.assertEqual(step("publish", "Push to the registry").get("if"), "steps.sign.outputs.ready == 'true'")
 
     def test_dry_run_uses_throwaway_test_keys(self):
         script = step("render", "Render")["run"]
@@ -129,12 +128,12 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
     def test_signing_secret_is_only_written_to_a_mode_0600_temp_file(self):
         publish = JOBS["publish"]
         secret_steps = [candidate for candidate in publish["steps"] if "FLEET_SIGNING_KEY" in yaml.safe_dump(candidate)]
-        self.assertEqual([candidate["name"] for candidate in secret_steps], ["Prepare signing key"])
+        self.assertEqual([candidate["name"] for candidate in secret_steps], ["Sign, pack and verify"])
         prepare = secret_steps[0]
         self.assertIn("umask 077", prepare["run"])
         self.assertIn("trap", prepare["run"])
         self.assertIn("chmod 600", prepare["run"])
-        self.assertNotIn("FLEET_SIGNING_KEY", step("publish", "Sign, pack and verify").get("env", {}))
+        self.assertIn("unset FLEET_SIGNING_KEY", prepare["run"])
 
     def test_publish_concurrency_never_cancels_an_in_progress_publish(self):
         concurrency = JOBS["publish"]["concurrency"]
