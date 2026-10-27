@@ -59,6 +59,8 @@ env:
   ANSIBLE_CORE_VERSION: 2.19.14
   ORAS_VERSION: 1.3.6
   ORAS_SHA256: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+  # Reviewed huynle/fleet task-4 verifier source. Update only by reviewed commit.
+  FLEET_VERIFIER_REF: c14dfb62812c47510a721450dc1aca7ca711e13c
 
 jobs:
   plan:
@@ -76,6 +78,14 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out reviewed fleet verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: huynle/fleet
+          ref: ${{ env.FLEET_VERIFIER_REF }}
+          path: .fleet-verifier
           persist-credentials: false
 
       - name: Validate inputs
@@ -126,6 +136,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          go build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./.fleet-verifier/cmd/fleet-bundle
 
       - name: Find affected machines
         id: affected
@@ -150,15 +161,28 @@ jobs:
             # therefore remains eligible on the next main push instead of being lost behind event.before.
             printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
             repo="$REGISTRY/$TENANT"
+            roots=()
+            for pub in "$FLEET_DIR"/keys/platform-root*.pub; do [ -f "$pub" ] && roots+=(-root "$pub"); done
+            [ "${#roots[@]}" -gt 0 ] || { echo "::error::no trusted platform root keys"; exit 1; }
             selected='[]'
             for machine in $("./$AFFECTED" --fleet "$FLEET_DIR" --all --json | jq -r '.[]'); do
               ref="$repo:$machine-current"
-              if manifest="$(oras manifest fetch "$ref" 2>"$RUNNER_TEMP/fetch.err")"; then
-                base="$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<<"$manifest")"
-                if [ -z "$base" ]; then
-                  echo "::error::$ref has no org.opencontainers.image.revision annotation"
-                  exit 1
-                fi
+              pulled="$RUNNER_TEMP/current/$machine"
+              mkdir -p "$pulled"
+              if oras pull "$ref" -o "$pulled" 2>"$RUNNER_TEMP/fetch.err"; then
+                mkdir "$pulled/unpacked"
+                tar --zstd -xf "$pulled/bundle.tar.zst" -C "$pulled/unpacked"
+                os="$(jq -r .os "$pulled/unpacked/manifest.json")"
+                arch="$(jq -r .arch "$pulled/unpacked/manifest.json")"
+                fleet-bundle verify "${roots[@]}" -tenant "$TENANT" -machine "$machine" -os "$os" -arch "$arch" \
+                  "$pulled/unpacked"
+                base="$(jq -r .source.commit "$pulled/unpacked/manifest.json")"
+                signed_sequence="$(jq -r .sequence "$pulled/unpacked/manifest.json")"
+                oci="$(oras manifest fetch "$ref")"
+                test "$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<<"$oci")" = "$base" ||
+                  { echo "::error::$ref revision annotation disagrees with signed manifest"; exit 1; }
+                test "$(jq -r '.annotations["org.huynle.fleet.sequence"] // empty' <<<"$oci")" = "$signed_sequence" ||
+                  { echo "::error::$ref sequence annotation disagrees with signed manifest"; exit 1; }
                 changed="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$base" --json)"
                 if jq -e --arg machine "$machine" 'index($machine) != null' <<<"$changed" >/dev/null; then
                   selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
@@ -196,6 +220,14 @@ jobs:
       - name: Check out caller source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
+
+      - name: Check out reviewed fleet verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: huynle/fleet
+          ref: ${{ env.FLEET_VERIFIER_REF }}
+          path: .fleet-verifier
           persist-credentials: false
 
       - name: Install tools
@@ -323,6 +355,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          go build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./.fleet-verifier/cmd/fleet-bundle
 
       - name: Download unsigned bundles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -398,8 +431,23 @@ jobs:
             cat "$error" >&2
             return 2
           }
+          verify_pulled() {
+            local ref="$1" machine="$2" target="$3"
+            rm -rf "$target"; mkdir -p "$target"
+            oras pull "$ref" -o "$target" >/dev/null
+            mkdir "$target/unpacked"
+            tar --zstd -xf "$target/bundle.tar.zst" -C "$target/unpacked"
+            local os arch
+            os="$(jq -r .os "$target/unpacked/manifest.json")"
+            arch="$(jq -r .arch "$target/unpacked/manifest.json")"
+            fleet-bundle verify "${roots[@]}" -tenant "$TENANT" -machine "$machine" -os "$os" -arch "$arch" \
+              "$target/unpacked" >/dev/null
+          }
           printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
           repo="$REGISTRY/$TENANT"
+          roots=()
+          for pub in "$FLEET_DIR"/keys/platform-root*.pub; do [ -f "$pub" ] && roots+=(-root "$pub"); done
+          [ "${#roots[@]}" -gt 0 ] || { echo "::error::no trusted platform root keys"; exit 1; }
           for dir in "$RUNNER_TEMP"/packed/*/; do
             machine="$(basename "$dir")"
             digest="$(sha256sum "$dir/manifest.json" | cut -d' ' -f1)"
@@ -408,9 +456,11 @@ jobs:
             state=0
             fetch_manifest "$ref" "$RUNNER_TEMP/existing.json" "$RUNNER_TEMP/fetch.err" || state=$?
             if [ "$state" = 0 ]; then
-              existing="$(cat "$RUNNER_TEMP/existing.json")"
-              # Same sequence: allowed only for the byte-identical signed manifest (contract section 4).
-              if [ "$(jq -r '.annotations["org.huynle.fleet.manifest-sha256"] // ""' <<<"$existing")" != "$digest" ]; then
+              verify_pulled "$ref" "$machine" "$RUNNER_TEMP/existing-$machine"
+              signed_sequence="$(jq -r .sequence "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json")"
+              signed_digest="$(sha256sum "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json" | cut -d' ' -f1)"
+              if [ "$signed_sequence" != "$SEQUENCE" ] || [ "$signed_digest" != "$digest" ] ||
+                 ! cmp -s "$dir/manifest.json.minisig" "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json.minisig"; then
                 echo "::error::$ref exists with a different signed manifest; refusing to overwrite"
                 exit 1
               fi
@@ -439,7 +489,13 @@ jobs:
             fetch_manifest "$current" "$RUNNER_TEMP/current.json" "$RUNNER_TEMP/fetch.err" || state=$?
             if [ "$state" = 0 ]; then
               cur="$(cat "$RUNNER_TEMP/current.json")"
-              at="$(jq -r '.annotations["org.huynle.fleet.sequence"] // "0"' <<<"$cur")"
+              verify_pulled "$current" "$machine" "$RUNNER_TEMP/current-$machine"
+              at="$(jq -r .sequence "$RUNNER_TEMP/current-$machine/unpacked/manifest.json")"
+              current_digest="$(sha256sum "$RUNNER_TEMP/current-$machine/unpacked/manifest.json" | cut -d' ' -f1)"
+              test "$(jq -r '.annotations["org.huynle.fleet.sequence"] // empty' <<<"$cur")" = "$at" ||
+                { echo "::error::$current sequence annotation disagrees with signed manifest"; exit 1; }
+              test "$(jq -r '.annotations["org.huynle.fleet.manifest-sha256"] // empty' <<<"$cur")" = "$current_digest" ||
+                { echo "::error::$current digest annotation disagrees with signed manifest"; exit 1; }
             elif [ "$state" != 1 ]; then exit "$state"; fi
             if [ "$at" -lt "$SEQUENCE" ]; then
               oras tag "$ref" "$machine-current"
