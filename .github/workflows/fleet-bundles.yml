@@ -226,6 +226,14 @@ jobs:
               tar --zstd -xf "$RUNNER_TEMP/$machine-1.tar.zst" -C "$RUNNER_TEMP/unpacked/$machine"
               "./$RENDER" verify "$RUNNER_TEMP/unpacked/$machine" --root "$RUNNER_TEMP/test-keys/root.pub" \
                 --tenant "$TENANT" --machine "$machine"
+              # Syntax-check each layer the way fleet-agent runs it (huynle/fleet docs/agent.md).
+              for layer in system/ansible user/ansible; do
+                dir="$RUNNER_TEMP/unpacked/$machine/$layer"
+                [ -f "$dir/playbook.yml" ] || continue
+                extra=()
+                [ -f "$dir/vars.yml" ] && extra=(-e @vars.yml)
+                (cd "$dir" && ansible-playbook --syntax-check -c local -i localhost, "${extra[@]}" playbook.yml)
+              done
             fi
           done
           echo "Rendered $rendered bundle(s)."

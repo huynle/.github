@@ -92,7 +92,7 @@ jobs:
 
 | Event | What runs |
 | --- | --- |
-| `pull_request` | Render dry-run of the affected machines: throwaway TEST root and tenant key made in the job, sign, pack twice (byte-identical), verify. No secret, no registry. |
+| `pull_request` | Render dry-run of the affected machines: throwaway TEST root and tenant key made in the job, sign, pack twice (byte-identical), verify, and `ansible-playbook --syntax-check -c local -i localhost, -e @vars.yml` per layer (how fleet-agent runs it). No secret, no registry. |
 | `push` to `main` | Render; then job `publish` in the caller's environment `fleet-signing` signs with `FLEET_SIGNING_KEY`, verifies against `<fleet-dir>/keys/platform-root*.pub` and pushes. |
 | anything else | Nothing is signed or pushed. |
 

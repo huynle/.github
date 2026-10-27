@@ -88,6 +88,13 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertIn('cmp "$RUNNER_TEMP/$machine-1.tar.zst" "$RUNNER_TEMP/$machine-2.tar.zst"', script)
         self.assertIn('"./$RENDER" verify', script)
 
+    def test_dry_run_syntax_checks_playbooks_the_way_fleet_agent_runs_them(self):
+        # fleet-agent runs `ansible-playbook -c local -i localhost, -e @vars.yml` (huynle/fleet docs/agent.md).
+        script = step("render", "Render")["run"]
+        self.assertIn('ansible-playbook --syntax-check -c local -i localhost, "${extra[@]}" playbook.yml', script)
+        self.assertIn("extra=(-e @vars.yml)", script)
+        self.assertIn("user/ansible", script)
+
     def test_run_scripts_do_not_interpolate_expressions(self):
         for name, job in JOBS.items():
             for candidate in job["steps"]:
