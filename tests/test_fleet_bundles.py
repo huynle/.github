@@ -58,7 +58,16 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertEqual(checkout["with"]["ref"], "${{ env.FLEET_VERIFIER_REF }}")
         self.assertEqual(checkout["with"]["path"], ".fleet-verifier")
         self.assertEqual(checkout["with"]["persist-credentials"], "false")
-        self.assertIn("./.fleet-verifier/cmd/fleet-bundle", steps[install_index]["run"])
+        self.assertIn("-C .fleet-verifier build", steps[install_index]["run"])
+        self.assertIn("./cmd/fleet-bundle", steps[install_index]["run"])
+
+    def test_every_verifier_build_runs_inside_the_checked_out_go_module(self):
+        builds = re.findall(r"^\s*go\s+(?:-C\s+\S+\s+)?build\b.*$", TEXT, flags=re.MULTILINE)
+        self.assertGreaterEqual(len(builds), 2)
+        for line in builds:
+            self.assertRegex(line, r"go\s+-C\s+\.fleet-verifier\s+build\b", line)
+            self.assertIn("./cmd/fleet-bundle", line)
+            self.assertNotIn("./.fleet-verifier/cmd/fleet-bundle", line)
 
     def test_registry_step_has_every_required_input_environment_variable(self):
         push = step("publish", "Push to the registry")
