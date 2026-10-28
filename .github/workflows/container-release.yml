@@ -28,7 +28,7 @@ on:
         default: '{}'
         type: string
       runner:
-        description: self-hosted (default) or ubuntu-latest
+        description: self-hosted (legacy amos label), github-ci, or ubuntu-latest
         required: false
         default: self-hosted
         type: string
@@ -64,7 +64,7 @@ concurrency:
 jobs:
   release:
     name: Validate, build, and publish
-    runs-on: ${{ fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || '["self-hosted","amos"]') }}
+    runs-on: ${{ fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || inputs.runner == 'github-ci' && '["self-hosted","github-ci"]' || '["self-hosted","amos"]') }}
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       git-tag: ${{ steps.release.outputs.git_tag }}
@@ -99,6 +99,7 @@ jobs:
           sha_re = re.compile(r"^[0-9a-f]{40}$")
           allowed_runners = {
               "self-hosted": '["self-hosted","amos"]',
+              "github-ci": '["self-hosted","github-ci"]',
               "ubuntu-latest": '"ubuntu-latest"',
           }
 
@@ -137,7 +138,7 @@ jobs:
 
           runner = os.environ["INPUT_RUNNER"]
           if runner not in allowed_runners:
-              fail("runner must be self-hosted or ubuntu-latest")
+              fail("runner must be self-hosted, github-ci, or ubuntu-latest")
 
           sha = os.environ["INPUT_SHA"]
           if not sha_re.fullmatch(sha):
