@@ -74,6 +74,13 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertEqual(list(WORKFLOW["on"]), ["workflow_call"])
         self.assertEqual(WORKFLOW["on"]["workflow_call"]["inputs"]["tenant"]["required"], "true")
 
+    def test_private_verifier_checkouts_use_explicit_read_only_secret(self):
+        secrets = WORKFLOW["on"]["workflow_call"]["secrets"]
+        self.assertEqual(secrets["fleet-token"]["required"], "true")
+        for job_name in ("plan", "render", "publish"):
+            checkout = step(job_name, "Check out reviewed fleet verifier")
+            self.assertEqual(checkout["with"]["token"], "${{ secrets.fleet-token }}")
+
     def test_actions_are_pinned_to_full_commit_shas(self):
         uses = re.findall(r"uses:\s+([^\s#]+)", TEXT)
         self.assertTrue(uses)
@@ -93,8 +100,8 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
 
     def test_signing_key_only_in_publish_job_on_main_push(self):
         for name, job in JOBS.items():
-            uses_secrets = "secrets." in yaml.safe_dump(job)
-            self.assertEqual(uses_secrets, name == "publish", name)
+            uses_signing_key = "FLEET_SIGNING_KEY" in yaml.safe_dump(job)
+            self.assertEqual(uses_signing_key, name == "publish", name)
         publish = JOBS["publish"]
         self.assertEqual(publish["environment"], "fleet-signing")
         condition = " ".join(publish["if"].split())

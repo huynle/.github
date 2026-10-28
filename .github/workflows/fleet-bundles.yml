@@ -12,6 +12,13 @@ name: Fleet bundles v1
 
 on:
   workflow_call:
+    secrets:
+      fleet-token:
+        description: Read-only token for the private huynle/fleet verifier source
+        required: true
+      FLEET_SIGNING_KEY:
+        description: Tenant signing key for trusted main publication
+        required: false
     inputs:
       tenant:
         description: Tenant id (DNS label); <fleet-dir>/tenants/<tenant>.yaml must exist
@@ -87,6 +94,7 @@ jobs:
           ref: ${{ env.FLEET_VERIFIER_REF }}
           path: .fleet-verifier
           persist-credentials: false
+          token: ${{ secrets.fleet-token }}
 
       - name: Validate inputs
         id: validate
@@ -229,6 +237,7 @@ jobs:
           ref: ${{ env.FLEET_VERIFIER_REF }}
           path: .fleet-verifier
           persist-credentials: false
+          token: ${{ secrets.fleet-token }}
 
       - name: Install tools
         run: |
@@ -349,6 +358,7 @@ jobs:
           ref: ${{ env.FLEET_VERIFIER_REF }}
           path: .fleet-verifier
           persist-credentials: false
+          token: ${{ secrets.fleet-token }}
 
       - name: Install tools
         run: |
