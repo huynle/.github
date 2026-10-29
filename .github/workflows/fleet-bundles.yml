@@ -1,0 +1,526 @@
+name: Fleet bundles v1
+
+# Renders, signs and pushes one fleet bundle per affected machine of a tenant repository (huynle/fleet
+# docs/contract.md section 4; huynle/infra docs/plans/2026-10-25-fleet-design.md section 2).
+#
+# pull_request: render dry-run. Affected machines are rendered, signed with a throwaway TEST key made in the job,
+#   packed twice (byte-identical check) and verified. No secret and no registry access.
+# push to main: render, then the publish job (GitHub environment `fleet-signing` of the caller) signs with the
+#   tenant key FLEET_SIGNING_KEY, verifies against the committed platform root keys and pushes OCI artifacts with
+#   oras. Without the secret or the committed tenant certificate it skips with a notice.
+# Any other event, branch or fork: nothing is signed or pushed.
+
+on:
+  workflow_call:
+    secrets:
+      fleet-token:
+        description: Read-only token for the private huynle/fleet verifier source
+        required: true
+      FLEET_SIGNING_KEY:
+        description: Tenant signing key for trusted main publication
+        required: false
+    inputs:
+      tenant:
+        description: Tenant id (DNS label); <fleet-dir>/tenants/<tenant>.yaml must exist
+        required: true
+        type: string
+      fleet-dir:
+        description: Repository-relative fleet tree
+        required: false
+        default: fleet
+        type: string
+      registry-repository:
+        description: Bundle repository (default ghcr.io/<lowercase owner>/fleet-bundles)
+        required: false
+        default: ''
+        type: string
+      render:
+        description: Repository-relative render tool (bundle, sign, pack, verify, sequence)
+        required: false
+        default: scripts/fleet/render
+        type: string
+      affected:
+        description: Repository-relative affected-machine tool
+        required: false
+        default: scripts/fleet/affected
+        type: string
+      test-keys:
+        description: Repository-relative TEST-key generator for pull-request dry-runs
+        required: false
+        default: scripts/fleet/test-keys
+        type: string
+    outputs:
+      machines:
+        description: JSON list of affected machine ids
+        value: ${{ jobs.plan.outputs.machines }}
+      sequence:
+        description: Bundle sequence of this commit
+        value: ${{ jobs.plan.outputs.sequence }}
+
+permissions:
+  contents: read
+
+env:
+  PYYAML_VERSION: 6.0.2
+  JSONSCHEMA_VERSION: 4.23.0
+  ANSIBLE_CORE_VERSION: 2.19.14
+  ORAS_VERSION: 1.3.6
+  ORAS_SHA256: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+  # Reviewed huynle/fleet task-4 verifier source. Update only by reviewed commit.
+  FLEET_VERIFIER_REF: c14dfb62812c47510a721450dc1aca7ca711e13c
+
+jobs:
+  plan:
+    name: Affected machines
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      machines: ${{ steps.affected.outputs.machines }}
+      sequence: ${{ steps.affected.outputs.sequence }}
+      registry: ${{ steps.validate.outputs.registry }}
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out reviewed fleet verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: huynle/fleet
+          ref: ${{ env.FLEET_VERIFIER_REF }}
+          path: .fleet-verifier
+          persist-credentials: false
+          token: ${{ secrets.fleet-token }}
+
+      - name: Validate inputs
+        id: validate
+        shell: bash
+        env:
+          INPUT_TENANT: ${{ inputs.tenant }}
+          INPUT_FLEET_DIR: ${{ inputs.fleet-dir }}
+          INPUT_REGISTRY: ${{ inputs.registry-repository }}
+          INPUT_RENDER: ${{ inputs.render }}
+          INPUT_AFFECTED: ${{ inputs.affected }}
+          INPUT_TEST_KEYS: ${{ inputs.test-keys }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import PurePosixPath
+
+          errors = []
+          tenant = os.environ["INPUT_TENANT"]
+          if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", tenant):
+              errors.append(f"tenant {tenant!r} is not a DNS label")
+          for name in ("FLEET_DIR", "RENDER", "AFFECTED", "TEST_KEYS"):
+              value = os.environ[f"INPUT_{name}"]
+              path = PurePosixPath(value)
+              if (not re.fullmatch(r"[A-Za-z0-9._/-]+", value) or path.is_absolute()
+                      or ".." in path.parts):
+                  errors.append(f"{name.lower()} {value!r} must be a plain repository-relative path")
+          registry = os.environ["INPUT_REGISTRY"] or f"ghcr.io/{os.environ['OWNER'].lower()}/fleet-bundles"
+          if not re.fullmatch(r"ghcr\.io/[a-z0-9-]+(/[a-z0-9._-]+)+", registry):
+              errors.append(f"registry-repository {registry!r} must be a lowercase ghcr.io repository")
+          if errors:
+              print("\n".join(f"::error::{e}" for e in errors))
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"registry={registry}\n")
+          PY
+
+      - name: Install renderer dependencies
+        run: |
+          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
+          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+
+      - name: Find affected machines
+        id: affected
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+          AFFECTED: ${{ inputs.affected }}
+          RENDER: ${{ inputs.render }}
+          TENANT: ${{ inputs.tenant }}
+          REGISTRY: ${{ steps.validate.outputs.registry }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$PR_BASE" --json)"
+          elif [ "$EVENT" = push ]; then
+            # Compare every machine with what was last ACTUALLY published. A cancelled or failed earlier run
+            # therefore remains eligible on the next main push instead of being lost behind event.before.
+            printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
+            repo="$REGISTRY/$TENANT"
+            roots=()
+            for pub in "$FLEET_DIR"/keys/platform-root*.pub; do [ -f "$pub" ] && roots+=(-root "$pub"); done
+            [ "${#roots[@]}" -gt 0 ] || { echo "::error::no trusted platform root keys"; exit 1; }
+            selected='[]'
+            for machine in $("./$AFFECTED" --fleet "$FLEET_DIR" --all --json | jq -r '.[]'); do
+              ref="$repo:$machine-current"
+              pulled="$RUNNER_TEMP/current/$machine"
+              mkdir -p "$pulled"
+              if oras pull "$ref" -o "$pulled" 2>"$RUNNER_TEMP/fetch.err"; then
+                mkdir "$pulled/unpacked"
+                tar --zstd -xf "$pulled/bundle.tar.zst" -C "$pulled/unpacked"
+                os="$(jq -r .os "$pulled/unpacked/manifest.json")"
+                arch="$(jq -r .arch "$pulled/unpacked/manifest.json")"
+                fleet-bundle verify "${roots[@]}" -tenant "$TENANT" -machine "$machine" -os "$os" -arch "$arch" \
+                  "$pulled/unpacked"
+                base="$(jq -r .source.commit "$pulled/unpacked/manifest.json")"
+                signed_sequence="$(jq -r .sequence "$pulled/unpacked/manifest.json")"
+                oci="$(oras manifest fetch "$ref")"
+                test "$(jq -r '.annotations["org.opencontainers.image.revision"] // empty' <<<"$oci")" = "$base" ||
+                  { echo "::error::$ref revision annotation disagrees with signed manifest"; exit 1; }
+                test "$(jq -r '.annotations["org.huynle.fleet.sequence"] // empty' <<<"$oci")" = "$signed_sequence" ||
+                  { echo "::error::$ref sequence annotation disagrees with signed manifest"; exit 1; }
+                changed="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$base" --json)"
+                if jq -e --arg machine "$machine" 'index($machine) != null' <<<"$changed" >/dev/null; then
+                  selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
+                fi
+              elif grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)|: not found$' "$RUNNER_TEMP/fetch.err"; then
+                selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
+              else
+                cat "$RUNNER_TEMP/fetch.err" >&2
+                exit 2
+              fi
+            done
+            oras logout ghcr.io
+            machines="$selected"
+          else
+            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --all --json)"
+          fi
+          # Sequence: first-parent commit count of the rendered commit (strictly increasing on a protected main).
+          sequence="$("./$RENDER" sequence HEAD)"
+          echo "Affected machines: $machines (sequence $sequence)"
+          {
+            echo "machines=$machines"
+            echo "sequence=$sequence"
+          } >>"$GITHUB_OUTPUT"
+
+  render:
+    name: Render bundles
+    needs: plan
+    if: needs.plan.outputs.machines != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.render.outputs.ready }}
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed fleet verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: huynle/fleet
+          ref: ${{ env.FLEET_VERIFIER_REF }}
+          path: .fleet-verifier
+          persist-credentials: false
+          token: ${{ secrets.fleet-token }}
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign zstd
+          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" \
+            "ansible-core==${ANSIBLE_CORE_VERSION}"
+
+      - name: Render
+        id: render
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          MACHINES: ${{ needs.plan.outputs.machines }}
+          SEQUENCE: ${{ needs.plan.outputs.sequence }}
+          TENANT: ${{ inputs.tenant }}
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+          RENDER: ${{ inputs.render }}
+          TEST_KEYS: ${{ inputs.test-keys }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
+            publish=true
+          fi
+          out="$RUNNER_TEMP/bundles"
+          mkdir -p "$out"
+          keys_args=()
+          if [ "$publish" = true ]; then
+            if [ ! -f "$FLEET_DIR/keys/tenant-key-cert.json" ]; then
+              echo "::notice::$FLEET_DIR/keys/tenant-key-cert.json is not committed yet; no bundles are published (docs/runbooks/fleet.md)."
+              echo "ready=false" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # Dry-run: a throwaway TEST root, tenant key and certificate; never the real signing key.
+            "./$TEST_KEYS" "$RUNNER_TEMP/test-keys" --tenant "$TENANT" >/dev/null
+            keys_args=(--keys "$RUNNER_TEMP/test-keys")
+          fi
+          rendered=0
+          for machine in $(jq -r '.[]' <<<"$MACHINES"); do
+            code=0
+            "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" --sequence "$SEQUENCE" \
+              --out "$out/$machine" ${keys_args[@]+"${keys_args[@]}"} || code=$?
+            if [ "$code" = 3 ]; then
+              echo "::warning::skipped $machine (cannot be rendered in CI yet; see the message above)"
+              continue
+            fi
+            [ "$code" = 0 ] || exit "$code"
+            rendered=$((rendered + 1))
+            if [ "$publish" = false ]; then
+              "./$RENDER" sign "$out/$machine" --key "$RUNNER_TEMP/test-keys/tenant.key"
+              "./$RENDER" pack "$out/$machine" "$RUNNER_TEMP/$machine-1.tar.zst"
+              "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" --sequence "$SEQUENCE" \
+                --out "$RUNNER_TEMP/again/$machine" "${keys_args[@]}"
+              "./$RENDER" sign "$RUNNER_TEMP/again/$machine" --key "$RUNNER_TEMP/test-keys/tenant.key"
+              "./$RENDER" pack "$RUNNER_TEMP/again/$machine" "$RUNNER_TEMP/$machine-2.tar.zst"
+              cmp "$RUNNER_TEMP/$machine-1.tar.zst" "$RUNNER_TEMP/$machine-2.tar.zst"
+              mkdir -p "$RUNNER_TEMP/unpacked/$machine"
+              tar --zstd -xf "$RUNNER_TEMP/$machine-1.tar.zst" -C "$RUNNER_TEMP/unpacked/$machine"
+              "./$RENDER" verify "$RUNNER_TEMP/unpacked/$machine" --root "$RUNNER_TEMP/test-keys/root.pub" \
+                --tenant "$TENANT" --machine "$machine"
+              # Syntax-check each layer the way fleet-agent runs it (huynle/fleet docs/agent.md).
+              for layer in system/ansible user/ansible; do
+                dir="$RUNNER_TEMP/unpacked/$machine/$layer"
+                [ -f "$dir/playbook.yml" ] || continue
+                extra=()
+                [ -f "$dir/vars.yml" ] && extra=(-e @vars.yml)
+                (cd "$dir" && ansible-playbook --syntax-check -c local -i localhost, "${extra[@]}" playbook.yml)
+              done
+            fi
+          done
+          echo "Rendered $rendered bundle(s)."
+          rm -rf "$RUNNER_TEMP/test-keys"
+          if [ "$publish" = true ] && [ "$rendered" -gt 0 ]; then
+            echo "ready=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload unsigned bundles
+        if: steps.render.outputs.ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fleet-bundles-unsigned
+          path: ${{ runner.temp }}/bundles
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Sign and push bundles
+    needs: [plan, render]
+    # Only pushes to main of the caller; never pull_request, forks or other branches. The caller's environment adds
+    # the owner's protection rules (main only, required reviewers) and holds FLEET_SIGNING_KEY.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.render.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: fleet-signing
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: fleet-bundles-publish-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed fleet verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: huynle/fleet
+          ref: ${{ env.FLEET_VERIFIER_REF }}
+          path: .fleet-verifier
+          persist-credentials: false
+          token: ${{ secrets.fleet-token }}
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign zstd
+          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
+          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+
+      - name: Download unsigned bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: fleet-bundles-unsigned
+          path: ${{ runner.temp }}/bundles
+
+      - name: Sign, pack and verify
+        id: sign
+        shell: bash
+        env:
+          FLEET_SIGNING_KEY: ${{ secrets.FLEET_SIGNING_KEY }}
+          TENANT: ${{ inputs.tenant }}
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+          RENDER: ${{ inputs.render }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FLEET_SIGNING_KEY" ]; then
+            echo "::notice::FLEET_SIGNING_KEY is not set; bundles are not signed or pushed."
+            echo "ready=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          roots=()
+          for pub in "$FLEET_DIR"/keys/platform-root*.pub; do
+            [ -f "$pub" ] && roots+=(--root "$pub")
+          done
+          if [ "${#roots[@]}" -eq 0 ]; then
+            echo "::error::no $FLEET_DIR/keys/platform-root*.pub committed; cannot check the tenant certificate"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/signing.key"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s\n' "$FLEET_SIGNING_KEY" >"$key"
+          chmod 600 "$key"
+          unset FLEET_SIGNING_KEY
+          for dir in "$RUNNER_TEMP"/bundles/*/; do
+            "./$RENDER" sign "$dir" --key "$key"
+          done
+          rm -f "$key"
+          echo "ready=true" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/packed"
+          for dir in "$RUNNER_TEMP"/bundles/*/; do
+            machine="$(basename "$dir")"
+            "./$RENDER" verify "$dir" "${roots[@]}" --tenant "$TENANT" --machine "$machine"
+            mkdir -p "$RUNNER_TEMP/packed/$machine"
+            "./$RENDER" pack "$dir" "$RUNNER_TEMP/packed/$machine/bundle.tar.zst"
+            cp "$dir"/manifest.json "$dir"/manifest.json.minisig "$dir"/tenant-key-cert.json \
+              "$dir"/tenant-key-cert.json.minisig "$RUNNER_TEMP/packed/$machine/"
+          done
+
+      - name: Push to the registry
+        if: steps.sign.outputs.ready == 'true'
+        shell: bash
+        env:
+          REGISTRY: ${{ needs.plan.outputs.registry }}
+          SEQUENCE: ${{ needs.plan.outputs.sequence }}
+          TENANT: ${{ inputs.tenant }}
+          ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          REVISION: ${{ github.sha }}
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+        run: |
+          set -euo pipefail
+          fetch_manifest() {
+            local ref="$1" output="$2" error="$3"
+            if oras manifest fetch "$ref" >"$output" 2>"$error"; then
+              return 0
+            fi
+            if grep -Eqi 'MANIFEST_UNKNOWN|NAME_UNKNOWN|(^|[^0-9])404([^0-9]|$)|: not found$' "$error"; then
+              return 1
+            fi
+            cat "$error" >&2
+            return 2
+          }
+          verify_pulled() {
+            local ref="$1" machine="$2" target="$3"
+            rm -rf "$target"; mkdir -p "$target"
+            oras pull "$ref" -o "$target" >/dev/null
+            mkdir "$target/unpacked"
+            tar --zstd -xf "$target/bundle.tar.zst" -C "$target/unpacked"
+            local os arch
+            os="$(jq -r .os "$target/unpacked/manifest.json")"
+            arch="$(jq -r .arch "$target/unpacked/manifest.json")"
+            fleet-bundle verify "${roots[@]}" -tenant "$TENANT" -machine "$machine" -os "$os" -arch "$arch" \
+              "$target/unpacked" >/dev/null
+          }
+          printf '%s' "$GITHUB_TOKEN" | oras login ghcr.io --username "$ACTOR" --password-stdin
+          repo="$REGISTRY/$TENANT"
+          roots=()
+          for pub in "$FLEET_DIR"/keys/platform-root*.pub; do [ -f "$pub" ] && roots+=(-root "$pub"); done
+          [ "${#roots[@]}" -gt 0 ] || { echo "::error::no trusted platform root keys"; exit 1; }
+          for dir in "$RUNNER_TEMP"/packed/*/; do
+            machine="$(basename "$dir")"
+            digest="$(sha256sum "$dir/manifest.json" | cut -d' ' -f1)"
+            ref="$repo:$machine-$SEQUENCE"
+            current="$repo:$machine-current"
+            state=0
+            fetch_manifest "$ref" "$RUNNER_TEMP/existing.json" "$RUNNER_TEMP/fetch.err" || state=$?
+            if [ "$state" = 0 ]; then
+              verify_pulled "$ref" "$machine" "$RUNNER_TEMP/existing-$machine"
+              signed_sequence="$(jq -r .sequence "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json")"
+              signed_digest="$(sha256sum "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json" | cut -d' ' -f1)"
+              if [ "$signed_sequence" != "$SEQUENCE" ] || [ "$signed_digest" != "$digest" ] ||
+                 ! cmp -s "$dir/manifest.json.minisig" "$RUNNER_TEMP/existing-$machine/unpacked/manifest.json.minisig"; then
+                echo "::error::$ref exists with a different signed manifest; refusing to overwrite"
+                exit 1
+              fi
+              echo "$ref already holds this bundle"
+            elif [ "$state" = 1 ]; then
+              (
+                cd "$dir"
+                oras push "$ref" \
+                  --artifact-type application/vnd.huynle.fleet.bundle.v1.tar+zstd \
+                  --annotation "org.opencontainers.image.source=$SOURCE" \
+                  --annotation "org.opencontainers.image.revision=$REVISION" \
+                  --annotation "org.huynle.fleet.tenant=$TENANT" \
+                  --annotation "org.huynle.fleet.machine=$machine" \
+                  --annotation "org.huynle.fleet.sequence=$SEQUENCE" \
+                  --annotation "org.huynle.fleet.manifest-sha256=$digest" \
+                  bundle.tar.zst:application/vnd.huynle.fleet.bundle.v1.tar+zstd \
+                  manifest.json:application/vnd.huynle.fleet.bundle.manifest.v1+json \
+                  manifest.json.minisig:application/vnd.huynle.fleet.minisig.v1 \
+                  tenant-key-cert.json:application/vnd.huynle.fleet.tenant-key-cert.v1+json \
+                  tenant-key-cert.json.minisig:application/vnd.huynle.fleet.minisig.v1
+              )
+            else exit "$state"; fi
+            # Move <tenant>-<machine>-current forward only: an older run finishing late never moves it back.
+            at=0
+            state=0
+            fetch_manifest "$current" "$RUNNER_TEMP/current.json" "$RUNNER_TEMP/fetch.err" || state=$?
+            if [ "$state" = 0 ]; then
+              cur="$(cat "$RUNNER_TEMP/current.json")"
+              verify_pulled "$current" "$machine" "$RUNNER_TEMP/current-$machine"
+              at="$(jq -r .sequence "$RUNNER_TEMP/current-$machine/unpacked/manifest.json")"
+              current_digest="$(sha256sum "$RUNNER_TEMP/current-$machine/unpacked/manifest.json" | cut -d' ' -f1)"
+              test "$(jq -r '.annotations["org.huynle.fleet.sequence"] // empty' <<<"$cur")" = "$at" ||
+                { echo "::error::$current sequence annotation disagrees with signed manifest"; exit 1; }
+              test "$(jq -r '.annotations["org.huynle.fleet.manifest-sha256"] // empty' <<<"$cur")" = "$current_digest" ||
+                { echo "::error::$current digest annotation disagrees with signed manifest"; exit 1; }
+            elif [ "$state" != 1 ]; then exit "$state"; fi
+            if [ "$at" -lt "$SEQUENCE" ]; then
+              oras tag "$ref" "$machine-current"
+              echo "$current -> sequence $SEQUENCE"
+            else
+              echo "::notice::$current already at sequence $at (>= $SEQUENCE); not moved"
+            fi
+          done
+          oras logout ghcr.io

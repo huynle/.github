@@ -70,6 +70,52 @@ Images include OCI source, revision, and version labels. The workflow does not p
 4. an invalid path, image, platform, runner, or build-args object fails before login/build;
 5. a failed caller test skips the release job and creates no image.
 
+## Fleet bundles v1
+
+`.github/workflows/fleet-bundles.yml` renders, signs and pushes one fleet bundle per affected machine of a fleet
+tenant repository (huynle/infra is the home tenant; contract: huynle/fleet `docs/contract.md` §4). Each tenant repo
+calls it with its own tenant id and holds its own signing key; this workflow holds no key.
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  bundles:
+    permissions:
+      contents: read
+      packages: write
+    uses: huynle/.github/.github/workflows/fleet-bundles.yml@<reviewed v1 commit> # v1
+    with:
+      tenant: home
+```
+
+| Event | What runs |
+| --- | --- |
+| `pull_request` | Render dry-run of the affected machines: throwaway TEST root and tenant key made in the job, sign, pack twice (byte-identical), verify, and `ansible-playbook --syntax-check -c local -i localhost, -e @vars.yml` per layer (how fleet-agent runs it). No secret, no registry. |
+| `push` to `main` | Render; then job `publish` in the caller's environment `fleet-signing` signs with `FLEET_SIGNING_KEY`, verifies against `<fleet-dir>/keys/platform-root*.pub` and pushes. |
+| anything else | Nothing is signed or pushed. |
+
+Skips with a notice (not a failure) while `<fleet-dir>/keys/tenant-key-cert.json` is not committed or the
+environment has no `FLEET_SIGNING_KEY`. Machines the renderer cannot build yet (exit 3: Windows, platform roles
+without the platform artifact) are skipped with a warning.
+
+| Input | Default | Rules |
+| --- | --- | --- |
+| `tenant` | required | DNS label |
+| `fleet-dir` | `fleet` | Repository-relative path |
+| `registry-repository` | `ghcr.io/<lowercase owner>/fleet-bundles` | Lowercase `ghcr.io/...` repository |
+| `render`, `affected`, `test-keys` | `scripts/fleet/{render,affected,test-keys}` | Repository-relative paths in the caller |
+
+Registry layout (contract §4): `<registry>:<tenant>-<machine>-<sequence>` and the moving tag
+`<tenant>-<machine>-current`, which only ever moves to a higher sequence. An existing sequence tag is never
+overwritten with a different signed manifest. Layers: `bundle.tar.zst`, `manifest.json`, `manifest.json.minisig`,
+`tenant-key-cert.json`, `tenant-key-cert.json.minisig`; annotations `org.huynle.fleet.{tenant,machine,sequence,
+manifest-sha256}`. The sequence is the first-parent commit count of the rendered commit on `main`.
+
+Caller environment `fleet-signing`: deployment branches `main` only, required reviewers, secret `FLEET_SIGNING_KEY`
+(the unencrypted minisign tenant secret key, `minisign -G -W`). Key handling: huynle/infra `docs/runbooks/fleet.md`.
+
 ## Maintainer checks
 
 ```bash
