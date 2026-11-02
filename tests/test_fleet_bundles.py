@@ -30,6 +30,7 @@ def run_validator(**overrides):
         "INPUT_RENDER": "scripts/fleet/render",
         "INPUT_AFFECTED": "scripts/fleet/affected",
         "INPUT_TEST_KEYS": "scripts/fleet/test-keys",
+        "INPUT_PLATFORM": "ghcr.io/huynle/fleet-platform",
         "OWNER": "HuyNle",
     }
     env.update({f"INPUT_{k.upper()}": v for k, v in overrides.items() if k != "owner"})
