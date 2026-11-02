@@ -49,6 +49,11 @@ on:
         required: false
         default: scripts/fleet/test-keys
         type: string
+      platform-repository:
+        description: Signed platform artifact repository (roles and profiles shared by every tenant)
+        required: false
+        default: ghcr.io/huynle/fleet-platform
+        type: string
     outputs:
       machines:
         description: JSON list of affected machine ids
@@ -80,6 +85,7 @@ jobs:
       machines: ${{ steps.affected.outputs.machines }}
       sequence: ${{ steps.affected.outputs.sequence }}
       registry: ${{ steps.validate.outputs.registry }}
+      platform: ${{ steps.validate.outputs.platform_repository }}
     steps:
       - name: Check out caller source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -106,6 +112,7 @@ jobs:
           INPUT_RENDER: ${{ inputs.render }}
           INPUT_AFFECTED: ${{ inputs.affected }}
           INPUT_TEST_KEYS: ${{ inputs.test-keys }}
+          INPUT_PLATFORM: ${{ inputs.platform-repository }}
           OWNER: ${{ github.repository_owner }}
         run: |
           python3 - <<'PY'
@@ -127,11 +134,15 @@ jobs:
           registry = os.environ["INPUT_REGISTRY"] or f"ghcr.io/{os.environ['OWNER'].lower()}/fleet-bundles"
           if not re.fullmatch(r"ghcr\.io/[a-z0-9-]+(/[a-z0-9._-]+)+", registry):
               errors.append(f"registry-repository {registry!r} must be a lowercase ghcr.io repository")
+          platform = os.environ["INPUT_PLATFORM"]
+          if not re.fullmatch(r"ghcr\.io/[a-z0-9-]+(/[a-z0-9._-]+)+", platform):
+              errors.append(f"platform-repository {platform!r} must be a lowercase ghcr.io repository")
           if errors:
               print("\n".join(f"::error::{e}" for e in errors))
               sys.exit(1)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write(f"registry={registry}\n")
+              out.write(f"platform_repository={platform}\n")
           PY
 
       - name: Install renderer dependencies
@@ -145,6 +156,41 @@ jobs:
           tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
           go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+
+      - name: Fetch signed platform
+        id: platform
+        shell: bash
+        env:
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+          TENANT: ${{ inputs.tenant }}
+          PLATFORM_REPOSITORY: ${{ steps.validate.outputs.platform_repository }}
+        run: |
+          set -euo pipefail
+          # The platform (roles and profiles shared by every tenant) is a signed artifact. platform_version in the
+          # tenant file selects it; 0.0.0 means none is published yet. It is read anonymously (the package is
+          # public) and used only after fleet-bundle verify-platform accepts it against the committed release keys.
+          version="$(python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print(d.get("platform_version", "") if isinstance(d, dict) else "")' "$FLEET_DIR/tenants/$TENANT.yaml")"
+          if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
+            echo "::notice::platform_version is ${version:-unset}: profiles and roles from the platform are not available."
+            echo "dir=" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::platform_version $version is not X.Y.Z"; exit 1; }
+          keys=()
+          for pub in "$FLEET_DIR"/keys/platform-release*.pub; do [ -f "$pub" ] && keys+=(-key "$pub"); done
+          [ "${#keys[@]}" -gt 0 ] || { echo "::error::no $FLEET_DIR/keys/platform-release*.pub committed; cannot verify the platform"; exit 1; }
+          pulled="$RUNNER_TEMP/platform-pulled"
+          target="$RUNNER_TEMP/platform"
+          mkdir -p "$pulled" "$target"
+          if ! oras pull "$PLATFORM_REPOSITORY:$version" -o "$pulled" 2>"$RUNNER_TEMP/platform.err"; then
+            cat "$RUNNER_TEMP/platform.err" >&2
+            echo "::error::cannot pull $PLATFORM_REPOSITORY:$version (is the package public, or readable by this repository?)"
+            exit 1
+          fi
+          [ -f "$pulled/platform.tar.zst" ] || { echo "::error::$PLATFORM_REPOSITORY:$version has no platform.tar.zst"; exit 1; }
+          tar --zstd --no-same-owner -xf "$pulled/platform.tar.zst" -C "$target"
+          fleet-bundle verify-platform "${keys[@]}" -version "$version" "$target"
+          echo "dir=$target" >>"$GITHUB_OUTPUT"
 
       - name: Find affected machines
         id: affected
@@ -160,10 +206,13 @@ jobs:
           REGISTRY: ${{ steps.validate.outputs.registry }}
           ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
+          PLATFORM_DIR: ${{ steps.platform.outputs.dir }}
         run: |
           set -euo pipefail
+          platform_args=()
+          [ -z "$PLATFORM_DIR" ] || platform_args=(--platform "$PLATFORM_DIR")
           if [ "$EVENT" = pull_request ]; then
-            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$PR_BASE" --json)"
+            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --base "$PR_BASE" --json)"
           elif [ "$EVENT" = push ]; then
             # Compare every machine with what was last ACTUALLY published. A cancelled or failed earlier run
             # therefore remains eligible on the next main push instead of being lost behind event.before.
@@ -173,7 +222,7 @@ jobs:
             for pub in "$FLEET_DIR"/keys/platform-root*.pub; do [ -f "$pub" ] && roots+=(-root "$pub"); done
             [ "${#roots[@]}" -gt 0 ] || { echo "::error::no trusted platform root keys"; exit 1; }
             selected='[]'
-            for machine in $("./$AFFECTED" --fleet "$FLEET_DIR" --all --json | jq -r '.[]'); do
+            for machine in $("./$AFFECTED" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --all --json | jq -r '.[]'); do
               ref="$repo:$machine-current"
               pulled="$RUNNER_TEMP/current/$machine"
               mkdir -p "$pulled"
@@ -191,7 +240,7 @@ jobs:
                   { echo "::error::$ref revision annotation disagrees with signed manifest"; exit 1; }
                 test "$(jq -r '.annotations["org.huynle.fleet.sequence"] // empty' <<<"$oci")" = "$signed_sequence" ||
                   { echo "::error::$ref sequence annotation disagrees with signed manifest"; exit 1; }
-                changed="$("./$AFFECTED" --fleet "$FLEET_DIR" --base "$base" --json)"
+                changed="$("./$AFFECTED" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --base "$base" --json)"
                 if jq -e --arg machine "$machine" 'index($machine) != null' <<<"$changed" >/dev/null; then
                   selected="$(jq -c --arg machine "$machine" '. + [$machine] | unique' <<<"$selected")"
                 fi
@@ -205,7 +254,7 @@ jobs:
             oras logout ghcr.io
             machines="$selected"
           else
-            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" --all --json)"
+            machines="$("./$AFFECTED" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --all --json)"
           fi
           # Sequence: first-parent commit count of the rendered commit (strictly increasing on a protected main).
           sequence="$("./$RENDER" sequence HEAD)"
@@ -247,6 +296,53 @@ jobs:
           pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" \
             "ansible-core==${ANSIBLE_CORE_VERSION}"
 
+      - name: Install platform fetch tools
+        run: |
+          set -euo pipefail
+          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
+          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
+          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      - name: Fetch signed platform
+        id: platform
+        shell: bash
+        env:
+          FLEET_DIR: ${{ inputs.fleet-dir }}
+          TENANT: ${{ inputs.tenant }}
+          PLATFORM_REPOSITORY: ${{ needs.plan.outputs.platform }}
+        run: |
+          set -euo pipefail
+          # The platform (roles and profiles shared by every tenant) is a signed artifact. platform_version in the
+          # tenant file selects it; 0.0.0 means none is published yet. It is read anonymously (the package is
+          # public) and used only after fleet-bundle verify-platform accepts it against the committed release keys.
+          version="$(python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print(d.get("platform_version", "") if isinstance(d, dict) else "")' "$FLEET_DIR/tenants/$TENANT.yaml")"
+          if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
+            echo "::notice::platform_version is ${version:-unset}: profiles and roles from the platform are not available."
+            echo "dir=" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::platform_version $version is not X.Y.Z"; exit 1; }
+          keys=()
+          for pub in "$FLEET_DIR"/keys/platform-release*.pub; do [ -f "$pub" ] && keys+=(-key "$pub"); done
+          [ "${#keys[@]}" -gt 0 ] || { echo "::error::no $FLEET_DIR/keys/platform-release*.pub committed; cannot verify the platform"; exit 1; }
+          pulled="$RUNNER_TEMP/platform-pulled"
+          target="$RUNNER_TEMP/platform"
+          mkdir -p "$pulled" "$target"
+          if ! oras pull "$PLATFORM_REPOSITORY:$version" -o "$pulled" 2>"$RUNNER_TEMP/platform.err"; then
+            cat "$RUNNER_TEMP/platform.err" >&2
+            echo "::error::cannot pull $PLATFORM_REPOSITORY:$version (is the package public, or readable by this repository?)"
+            exit 1
+          fi
+          [ -f "$pulled/platform.tar.zst" ] || { echo "::error::$PLATFORM_REPOSITORY:$version has no platform.tar.zst"; exit 1; }
+          tar --zstd --no-same-owner -xf "$pulled/platform.tar.zst" -C "$target"
+          fleet-bundle verify-platform "${keys[@]}" -version "$version" "$target"
+          echo "dir=$target" >>"$GITHUB_OUTPUT"
+
       - name: Render
         id: render
         shell: bash
@@ -259,6 +355,7 @@ jobs:
           FLEET_DIR: ${{ inputs.fleet-dir }}
           RENDER: ${{ inputs.render }}
           TEST_KEYS: ${{ inputs.test-keys }}
+          PLATFORM_DIR: ${{ steps.platform.outputs.dir }}
         run: |
           set -euo pipefail
           publish=false
@@ -279,10 +376,12 @@ jobs:
             "./$TEST_KEYS" "$RUNNER_TEMP/test-keys" --tenant "$TENANT" >/dev/null
             keys_args=(--keys "$RUNNER_TEMP/test-keys")
           fi
+          platform_args=()
+          [ -z "$PLATFORM_DIR" ] || platform_args=(--platform "$PLATFORM_DIR")
           rendered=0
           for machine in $(jq -r '.[]' <<<"$MACHINES"); do
             code=0
-            "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" --sequence "$SEQUENCE" \
+            "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --sequence "$SEQUENCE" \
               --out "$out/$machine" ${keys_args[@]+"${keys_args[@]}"} || code=$?
             if [ "$code" = 3 ]; then
               echo "::warning::skipped $machine (cannot be rendered in CI yet; see the message above)"
@@ -293,7 +392,7 @@ jobs:
             if [ "$publish" = false ]; then
               "./$RENDER" sign "$out/$machine" --key "$RUNNER_TEMP/test-keys/tenant.key"
               "./$RENDER" pack "$out/$machine" "$RUNNER_TEMP/$machine-1.tar.zst"
-              "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" --sequence "$SEQUENCE" \
+              "./$RENDER" bundle "$machine" --tenant "$TENANT" --fleet "$FLEET_DIR" ${platform_args[@]+"${platform_args[@]}"} --sequence "$SEQUENCE" \
                 --out "$RUNNER_TEMP/again/$machine" "${keys_args[@]}"
               "./$RENDER" sign "$RUNNER_TEMP/again/$machine" --key "$RUNNER_TEMP/test-keys/tenant.key"
               "./$RENDER" pack "$RUNNER_TEMP/again/$machine" "$RUNNER_TEMP/$machine-2.tar.zst"
