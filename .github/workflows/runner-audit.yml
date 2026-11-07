@@ -1,0 +1,79 @@
+name: Runner policy audit
+
+# Weekly check of the org runner policy (Brain infra decision 8hrn3rpu): private repositories must select their
+# runner from vars.CI_RUNNER, public repositories must not use self-hosted runners (above all on events that people
+# outside the organization can trigger). Reports in one issue titled "Runner policy audit" and in the job summary.
+#
+# No pull_request trigger: this public repository's PRs never reach the audit token.
+# Private repositories are listed only with the RUNNER_AUDIT_TOKEN secret (environment runner-audit, see README);
+# without it the job falls back to GITHUB_TOKEN and audits public repositories only.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1' # Mondays 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: runner-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit workflow runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: runner-audit
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install PyYAML
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+
+      - name: Audit organization workflows
+        env:
+          AUDIT_TOKEN: ${{ secrets.RUNNER_AUDIT_TOKEN || github.token }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          python3 scripts/runner_audit.py --json-out "$RUNNER_TEMP/audit.json" >"$RUNNER_TEMP/audit.md"
+          cat "$RUNNER_TEMP/audit.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the audit issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Runner policy audit"
+          findings="$(jq '.findings | length' "$RUNNER_TEMP/audit.json")"
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "Updated by [workflow run]($RUN_URL) on $(date -u +%Y-%m-%d)."
+            echo
+            # Issue bodies are limited to 65536 characters; the job summary always has the full report.
+            head -c 60000 "$RUNNER_TEMP/audit.md"
+            [ "$(wc -c <"$RUNNER_TEMP/audit.md")" -le 60000 ] || printf '\n\n_Truncated: see the run summary._\n'
+          } >"$body"
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
+            --search "\"$title\" in:title author:app/github-actions" --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")" || {
+            echo "::warning::Cannot read issues with GITHUB_TOKEN; the report is in the job summary only."
+            exit 0
+          }
+          if [ "$findings" -gt 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+              gh issue reopen "$number" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "No findings in $RUN_URL." 2>/dev/null || true
+          fi

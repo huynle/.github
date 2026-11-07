@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
       - run: ./scripts/test
@@ -25,8 +25,9 @@ jobs:
       image: ghcr.io/huynle/my-app
       context: .
       dockerfile: Dockerfile
-      # Default: self-hosted runner labels [self-hosted, amos].
-      runner: self-hosted
+      # Private repositories: the org variable CI_RUNNER (see "Runner selection");
+      # `runner: ci-runner` once v1 contains it. Public repositories: ubuntu-latest.
+      runner: ${{ vars.CI_RUNNER && 'self-hosted' || 'ubuntu-latest' }}
       # JSON object only; use Docker BuildKit secrets in a dedicated workflow
       # rather than putting secrets in build arguments.
       build-args-json: '{"APP_ENV":"production"}'
@@ -47,9 +48,47 @@ The validator is inline in the reusable workflow. This is intentional: in an ext
 | `dockerfile` | string | `Dockerfile` | Repository-relative file; cannot escape checkout |
 | `platforms` | string | `linux/amd64` | Unique list of `linux/amd64`, `linux/arm64` |
 | `build-args-json` | string | `{}` | JSON object with uppercase environment-style keys and scalar, single-line values |
-| `runner` | string | `self-hosted` | `self-hosted` (`[self-hosted, amos]`) or `ubuntu-latest` |
+| `runner` | string | `self-hosted` | `ci-runner` (caller's `vars.CI_RUNNER`, else `ubuntu-latest`; an empty string means the same), `self-hosted` (`[self-hosted, amos]`), `github-ci` (`[self-hosted, github-ci]`), or `ubuntu-latest` |
 | `provenance` | boolean | `true` | BuildKit provenance attestation |
 | `sbom` | boolean | `true` | BuildKit SBOM attestation |
+
+### Runner selection (CI_RUNNER)
+
+Policy: Brain infra decision 8hrn3rpu and checklist 5p4j8gna. Private huynle repositories select every runner
+from the organization Actions variable `CI_RUNNER` (visibility: private repositories), a JSON label list such as
+`["self-hosted","amos","ci"]` for the shared `huynle-ci` runner on amos. When it is unset, jobs run GitHub-hosted:
+
+```yaml
+runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
+```
+
+A reusable workflow sees the **caller's** variables: "For reusable workflows, the variables from the caller
+workflow's repository are used. Variables from the repository that contains the called workflow are not made
+available to the caller workflow." ([Variables reference](https://docs.github.com/en/actions/reference/workflows-and-actions/variables);
+`vars` is allowed in `jobs.<job_id>.runs-on`, [Contexts reference](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)).
+So `runner: ci-runner` resolves `CI_RUNNER` as the calling repository sees it. Public callers never see the
+private-only org variable and therefore get `ubuntu-latest`, as the policy requires.
+
+| Caller passes | Runs on |
+| --- | --- |
+| `runner: ci-runner` or `runner: ''` | caller's `CI_RUNNER` labels; unset: `ubuntu-latest` |
+| nothing (default `self-hosted`) | `[self-hosted, amos]`, unchanged v1 behavior; public repositories should pass `ubuntu-latest` |
+| `self-hosted`, `github-ci`, `ubuntu-latest` | unchanged v1 behavior |
+
+`ci-runner` is additive. Until `v1` contains it (see "Updating pinned actions and v1"), private callers use the
+expression that every `v1` accepts:
+
+```yaml
+      runner: ${{ vars.CI_RUNNER && 'self-hosted' || 'ubuntu-latest' }}
+```
+
+The default stays `self-hosted`: changing it would move existing callers that pass no `runner`.
+
+`fleet-bundles.yml` keeps `ubuntu-latest` for now: its jobs install packages with `sudo apt-get` and `pip` outside
+the workspace and its publish job holds the tenant signing key, so it is not host-safe on the shared runner yet.
+
+Jobs on the shared runner must be host-safe: Docker-assigned host ports, container names that include
+`github.run_id`, `trap` cleanup, no kind or other clusters, and writes only inside the workspace.
 
 Outputs are `digest`, `git-tag`, and `sha-tag`. Every successful build publishes exactly two immutable identities:
 
@@ -116,6 +155,39 @@ manifest-sha256}`. The sequence is the first-parent commit count of the rendered
 Caller environment `fleet-signing`: deployment branches `main` only, required reviewers, secret `FLEET_SIGNING_KEY`
 (the unencrypted minisign tenant secret key, `minisign -G -W`). Key handling: huynle/infra `docs/runbooks/fleet.md`.
 
+## Workflow templates
+
+`workflow-templates/huynle-ci.yml` appears under **Actions → New workflow** in every huynle repository. It carries
+the `CI_RUNNER` header, a host-safe container smoke test and a `container-release@v1` call. Public repositories
+replace `runs-on` with `ubuntu-latest`.
+
+## Runner policy audit
+
+`.github/workflows/runner-audit.yml` runs weekly (Mondays 06:23 UTC) and on manual dispatch, on `ubuntu-latest`,
+with no `pull_request` trigger. `scripts/runner_audit.py` reads every non-archived repository's default-branch
+workflows and lists:
+
+- private repositories with a job whose `runs-on` does not use `vars.CI_RUNNER`, or a `container-release` call
+  whose `runner` is fixed (including the `self-hosted` default);
+- public repositories with self-hosted runners, separately those on externally triggerable events
+  (`pull_request`, `pull_request_target`, `issue_comment`, `workflow_run`, ...).
+
+It opens or updates one issue titled **Runner policy audit** (closed when there are no findings) and writes the
+same report to the job summary. Run it locally with `AUDIT_TOKEN=$(gh auth token) python3 scripts/runner_audit.py`.
+
+`GITHUB_TOKEN` cannot list another repository's private content, so without a token the audit covers public
+repositories only and says so. Owner setup for private repositories:
+
+1. Org huynle → Settings → Personal access tokens → Settings: allow fine-grained tokens (approval required is fine).
+2. Your account → Settings → Developer settings → Fine-grained tokens → Generate: resource owner **huynle**,
+   repository access **All repositories**, repository permissions **Contents: Read-only** (Metadata: Read-only is
+   added automatically), expiration up to 1 year. Approve the request under Org → Personal access tokens if asked.
+   Actions: Read-only is optional; it only marks disabled workflows.
+3. huynle/.github → Settings → Environments → New environment **runner-audit** → Deployment branches: selected
+   branch `main` only → Add environment secret **RUNNER_AUDIT_TOKEN** with the token.
+4. Actions → Runner policy audit → Run workflow; the summary must not show the "No private repository was listed"
+   warning. Renew the token before it expires.
+
 ## Maintainer checks
 
 ```bash
@@ -129,7 +201,7 @@ actionlint
 2. Replace the 40-character SHA and adjacent version comment in the workflow and fixture.
 3. Run all maintainer checks and the fixture workflow from the feature branch.
 4. Merge through a reviewed PR.
-5. Fast-forward the protected `v1` branch to the tested `main` commit. Never force-push or retarget `v1` to an unreviewed commit.
+5. Fast-forward the protected `v1` branch to the tested `main` commit (`git push origin <main-sha>:refs/heads/v1`, a fast-forward). Never force-push or retarget `v1` to an unreviewed commit. Additive inputs such as `runner: ci-runner` reach `@v1` callers only after this step.
 6. Inspect the fixture package's two tags, digest, labels, provenance, and SBOM.
 
 Required repository/organization settings:

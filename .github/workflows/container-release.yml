@@ -28,7 +28,9 @@ on:
         default: '{}'
         type: string
       runner:
-        description: self-hosted (legacy amos label), github-ci, or ubuntu-latest
+        description: >-
+          ci-runner (the caller's CI_RUNNER Actions variable, else ubuntu-latest), self-hosted (legacy amos label),
+          github-ci, or ubuntu-latest. An empty string means ci-runner.
         required: false
         default: self-hosted
         type: string
@@ -64,7 +66,9 @@ concurrency:
 jobs:
   release:
     name: Validate, build, and publish
-    runs-on: ${{ fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || inputs.runner == 'github-ci' && '["self-hosted","github-ci"]' || '["self-hosted","amos"]') }}
+    # ci-runner reads vars.CI_RUNNER of the CALLER's repository (reusable workflows see the caller's variables):
+    # a JSON label list such as ["self-hosted","amos","ci"]; unset, ubuntu-latest. Other values are unchanged v1.
+    runs-on: ${{ (inputs.runner == 'ci-runner' || inputs.runner == '') && (vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest') || fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || inputs.runner == 'github-ci' && '["self-hosted","github-ci"]' || '["self-hosted","amos"]') }}
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       git-tag: ${{ steps.release.outputs.git_tag }}
@@ -83,6 +87,7 @@ jobs:
           INPUT_PLATFORMS: ${{ inputs.platforms }}
           INPUT_BUILD_ARGS_JSON: ${{ inputs.build-args-json }}
           INPUT_RUNNER: ${{ inputs.runner }}
+          VARS_CI_RUNNER: ${{ vars.CI_RUNNER }}
           INPUT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -102,6 +107,9 @@ jobs:
               "github-ci": '["self-hosted","github-ci"]',
               "ubuntu-latest": '"ubuntu-latest"',
           }
+          ci_runner = os.environ.get("VARS_CI_RUNNER", "") or '"ubuntu-latest"'
+          allowed_runners["ci-runner"] = ci_runner
+          allowed_runners[""] = ci_runner
 
           def fail(message):
               print(f"::error::{message}", file=sys.stderr)
@@ -138,7 +146,7 @@ jobs:
 
           runner = os.environ["INPUT_RUNNER"]
           if runner not in allowed_runners:
-              fail("runner must be self-hosted, github-ci, or ubuntu-latest")
+              fail("runner must be ci-runner, self-hosted, github-ci, or ubuntu-latest")
 
           sha = os.environ["INPUT_SHA"]
           if not sha_re.fullmatch(sha):

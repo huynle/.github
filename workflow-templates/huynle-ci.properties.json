@@ -1,0 +1,7 @@
+{
+  "name": "huynle CI (CI_RUNNER)",
+  "description": "Private-repository CI: runner from the org variable CI_RUNNER (self-hosted huynle-ci or GitHub-hosted), host-safe container smoke test, container-release@v1.",
+  "iconName": "octicon checklist",
+  "categories": ["Continuous integration", "Docker"],
+  "filePatterns": ["^Dockerfile$"]
+}
