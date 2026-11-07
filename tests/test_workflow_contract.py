@@ -99,6 +99,18 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("name: Validate release inputs", WORKFLOW)
         self.assertIn("python3 - <<'PY'", WORKFLOW)
 
+    def test_runner_input_keeps_v1_values_and_adds_ci_runner(self):
+        runs_on = re.search(r"^    runs-on: (.*)$", WORKFLOW, re.MULTILINE).group(1)
+        self.assertIn("(inputs.runner == 'ci-runner' || inputs.runner == '')", runs_on)
+        self.assertIn("vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest'", runs_on)
+        self.assertIn(
+            "fromJSON(inputs.runner == 'ubuntu-latest' && '\"ubuntu-latest\"' || inputs.runner == 'github-ci' && "
+            "'[\"self-hosted\",\"github-ci\"]' || '[\"self-hosted\",\"amos\"]')",
+            runs_on,
+        )
+        default = re.search(r"      runner:\n(?:        .*\n)*?        default: (\S+)", WORKFLOW).group(1)
+        self.assertEqual(default, "self-hosted", "changing the default would move existing v1 callers")
+
     def test_fixture_releases_only_after_test(self):
         self.assertIn("needs: test", FIXTURE)
         self.assertIn("@v1", FIXTURE)

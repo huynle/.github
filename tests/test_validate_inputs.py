@@ -29,7 +29,9 @@ def run_validator(**overrides):
         "INPUT_RUNNER": "self-hosted",
         "INPUT_SHA": "0123456789abcdef0123456789abcdef01234567",
     }
+    variables = {"VARS_CI_RUNNER": overrides.pop("vars_ci_runner", "")}
     payload.update({f"INPUT_{key.upper()}": value for key, value in overrides.items()})
+    payload.update(variables)
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "output"
         result = subprocess.run(
@@ -80,6 +82,24 @@ class ValidateInputsTests(unittest.TestCase):
         result, output = run_validator(build_args_json="{}", runner="ubuntu-latest")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("build_args= ", output)
+
+    def test_ci_runner_resolves_the_callers_variable_or_hosted(self):
+        for runner in ("ci-runner", ""):
+            with self.subTest(runner=runner):
+                result, output = run_validator(runner=runner, vars_ci_runner="")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('runner="ubuntu-latest"', output)
+                result, output = run_validator(runner=runner, vars_ci_runner='["self-hosted","amos","ci"]')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('runner=["self-hosted","amos","ci"]', output)
+
+    def test_legacy_runner_values_are_unchanged(self):
+        for runner, labels in (("self-hosted", '["self-hosted","amos"]'), ("github-ci", '["self-hosted","github-ci"]'),
+                               ("ubuntu-latest", '"ubuntu-latest"')):
+            with self.subTest(runner=runner):
+                result, output = run_validator(runner=runner, vars_ci_runner='["self-hosted","amos","ci"]')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"runner={labels}", output)
 
 
 if __name__ == "__main__":

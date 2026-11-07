@@ -1,0 +1,73 @@
+name: CI
+
+# huynle private-repository CI (Brain infra decision 8hrn3rpu, checklist 5p4j8gna).
+# Runner: the org Actions variable CI_RUNNER (JSON labels, e.g. ["self-hosted","amos","ci"] for the shared
+# huynle-ci runner on amos); unset, GitHub-hosted ubuntu-latest. Never hard-code a runner in a private repository.
+# Public repositories: replace runs-on with ubuntu-latest and never use self-hosted runners.
+# The runner is shared, so jobs must be host-safe: Docker-assigned host ports, container names that include
+# github.run_id, trap cleanup, no kind or other clusters, and writes only inside the workspace.
+
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Run tests
+        run: ./scripts/test
+
+  image:
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      IMAGE: ci-${{ github.event.repository.name }}:${{ github.run_id }}-${{ github.run_attempt }}
+      CONTAINER: ci-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build container
+        run: docker build --tag "$IMAGE" .
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+          trap 'docker rm --force "$CONTAINER" >/dev/null 2>&1 || true' EXIT
+          # 127.0.0.1:: lets Docker pick a free host port on the shared runner.
+          docker run --detach --name "$CONTAINER" --publish 127.0.0.1::8080 "$IMAGE"
+          port="$(docker port "$CONTAINER" 8080/tcp | head -1 | sed 's/.*://')"
+          for _ in $(seq 1 30); do
+            curl --fail --silent "http://127.0.0.1:${port}/healthz" >/dev/null && exit 0
+            sleep 1
+          done
+          docker logs "$CONTAINER" || true
+          exit 1
+      - name: Remove CI image
+        if: always()
+        run: docker image rm --force "$IMAGE" >/dev/null 2>&1 || true
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/$default-branch'
+    needs: [test, image]
+    permissions:
+      contents: read
+      packages: write
+    uses: huynle/.github/.github/workflows/container-release.yml@v1
+    with:
+      image: ghcr.io/${{ github.repository }}
+      # Works with every v1: CI_RUNNER set -> huynle-ci (self-hosted), unset -> GitHub-hosted. Once v1 contains
+      # the ci-runner value (huynle/.github README, "Runner selection"), `runner: ci-runner` is equivalent.
+      runner: ${{ vars.CI_RUNNER && 'self-hosted' || 'ubuntu-latest' }}
