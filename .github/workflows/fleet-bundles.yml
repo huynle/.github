@@ -78,8 +78,9 @@ env:
   GO_VERSION: 1.27.3
   GO_SHA256: 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
   UV_SHA256: 287491da03f2a785c70fa75b13e1f849918c2f2b5415fe84876b8214eeb792f9
-  # Reviewed huynle/fleet task-4 verifier source. Update only by reviewed commit.
-  FLEET_VERIFIER_REF: c14dfb62812c47510a721450dc1aca7ca711e13c
+  # Reviewed huynle/fleet verifier source (main 16b4cf7: knows engine dsc for Windows, ADR 0039). Update only by
+  # reviewed commit.
+  FLEET_VERIFIER_REF: 16b4cf7b74306af19960f403c0fec0179f08bdfa
 
 jobs:
   plan:
