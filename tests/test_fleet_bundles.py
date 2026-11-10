@@ -51,7 +51,7 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
     def test_publish_checks_out_reviewed_verifier_before_building_it(self):
         steps = JOBS["publish"]["steps"]
         checkout_index = next(i for i, item in enumerate(steps) if item.get("name") == "Check out reviewed fleet verifier")
-        install_index = next(i for i, item in enumerate(steps) if item.get("name") == "Install tools")
+        install_index = next(i for i, item in enumerate(steps) if item.get("name") == "Install toolchain")
         self.assertLess(checkout_index, install_index)
         checkout = steps[checkout_index]
         self.assertRegex(checkout["uses"], r"^actions/checkout@[0-9a-f]{40}$")
@@ -209,7 +209,7 @@ class FleetBundlesWorkflowTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", pr_branch)
 
     def test_oras_download_is_checksummed(self):
-        script = step("publish", "Install tools")["run"]
+        script = step("publish", "Install toolchain")["run"]
         self.assertIn("sha256sum --check", script)
         self.assertRegex(WORKFLOW["env"]["ORAS_SHA256"], r"^[0-9a-f]{64}$")
 
