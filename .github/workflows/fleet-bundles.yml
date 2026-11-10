@@ -71,13 +71,20 @@ env:
   ANSIBLE_CORE_VERSION: 2.19.14
   ORAS_VERSION: 1.3.6
   ORAS_SHA256: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+  MINISIGN_VERSION: "0.12"
+  MINISIGN_SHA256: 9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+  UV_VERSION: 0.13.7
+  # Matches huynle/fleet go.mod toolchain at FLEET_VERIFIER_REF.
+  GO_VERSION: 1.27.3
+  GO_SHA256: 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+  UV_SHA256: 287491da03f2a785c70fa75b13e1f849918c2f2b5415fe84876b8214eeb792f9
   # Reviewed huynle/fleet task-4 verifier source. Update only by reviewed commit.
   FLEET_VERIFIER_REF: c14dfb62812c47510a721450dc1aca7ca711e13c
 
 jobs:
   plan:
     name: Affected machines
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: read
@@ -145,17 +152,43 @@ jobs:
               out.write(f"platform_repository={platform}\n")
           PY
 
-      - name: Install renderer dependencies
+      - name: Install toolchain
+        env:
+          WANT_MINISIGN: "0"
+          PY_EXTRA: ""
         run: |
-          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
-          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
-            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
-          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
-          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
-          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+          set -euo pipefail
+          # Per-job toolchain: pinned, checksum-verified, under RUNNER_TEMP, no sudo (GitHub-hosted and self-hosted
+          # CI_RUNNER runners alike; self-hosted runners must not get system packages from jobs).
+          root="$RUNNER_TEMP/fleet-tools"; bin="$root/bin"; dl="$root/download"; mkdir -p "$bin" "$dl"
+          fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet -; }
+          command -v zstd >/dev/null || { echo "::error::zstd is missing on the runner (tar --zstd)"; exit 1; }
+          if [ "$WANT_MINISIGN" = 1 ]; then
+            fetch "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz" \
+              "$MINISIGN_SHA256" "$dl/minisign.tgz"
+            tar -xzf "$dl/minisign.tgz" -C "$dl" minisign-linux/x86_64/minisign
+            install -m 0755 "$dl/minisign-linux/x86_64/minisign" "$bin/minisign"
+          fi
+          fetch "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            "$ORAS_SHA256" "$dl/oras.tgz"
+          tar -xzf "$dl/oras.tgz" -C "$bin" oras
+          fetch "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
+            "$UV_SHA256" "$dl/uv.tgz"
+          tar -xzf "$dl/uv.tgz" -C "$dl" && install -m 0755 "$dl/uv-x86_64-unknown-linux-musl/uv" "$bin/uv"
+          export UV_CACHE_DIR="$root/uv-cache" UV_PYTHON_INSTALL_DIR="$root/python" UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1
+          "$bin/uv" python install --quiet 3.12
+          "$bin/uv" venv --quiet --python 3.12 "$root/venv"
+          # shellcheck disable=SC2086
+          VIRTUAL_ENV="$root/venv" "$bin/uv" pip install --quiet "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" $PY_EXTRA
+          rm -rf "$UV_CACHE_DIR"
+          echo "$root/venv/bin" >>"$GITHUB_PATH"
+          # fleet-bundle verifier: self-hosted runners have no Go, so build it with a pinned toolchain under $root.
+          fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256" "$dl/go.tgz"
+          tar -xzf "$dl/go.tgz" -C "$root"
+          GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
+            "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          rm -rf "$root/gocache" "$root/gopath" "$root/go"
+          echo "$bin" >>"$GITHUB_PATH"
 
       - name: Fetch signed platform
         id: platform
@@ -268,7 +301,7 @@ jobs:
     name: Render bundles
     needs: plan
     if: needs.plan.outputs.machines != '[]'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
     permissions:
       contents: read
     outputs:
@@ -288,25 +321,43 @@ jobs:
           persist-credentials: false
           token: ${{ secrets.fleet-token }}
 
-      - name: Install tools
+      - name: Install toolchain
+        env:
+          WANT_MINISIGN: "1"
+          PY_EXTRA: "ansible-core==${{ env.ANSIBLE_CORE_VERSION }}"
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq minisign zstd
-          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" \
-            "ansible-core==${ANSIBLE_CORE_VERSION}"
-
-      - name: Install platform fetch tools
-        run: |
-          set -euo pipefail
-          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
-            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
-          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
-          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
-          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          # Per-job toolchain: pinned, checksum-verified, under RUNNER_TEMP, no sudo (GitHub-hosted and self-hosted
+          # CI_RUNNER runners alike; self-hosted runners must not get system packages from jobs).
+          root="$RUNNER_TEMP/fleet-tools"; bin="$root/bin"; dl="$root/download"; mkdir -p "$bin" "$dl"
+          fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet -; }
+          command -v zstd >/dev/null || { echo "::error::zstd is missing on the runner (tar --zstd)"; exit 1; }
+          if [ "$WANT_MINISIGN" = 1 ]; then
+            fetch "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz" \
+              "$MINISIGN_SHA256" "$dl/minisign.tgz"
+            tar -xzf "$dl/minisign.tgz" -C "$dl" minisign-linux/x86_64/minisign
+            install -m 0755 "$dl/minisign-linux/x86_64/minisign" "$bin/minisign"
+          fi
+          fetch "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            "$ORAS_SHA256" "$dl/oras.tgz"
+          tar -xzf "$dl/oras.tgz" -C "$bin" oras
+          fetch "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
+            "$UV_SHA256" "$dl/uv.tgz"
+          tar -xzf "$dl/uv.tgz" -C "$dl" && install -m 0755 "$dl/uv-x86_64-unknown-linux-musl/uv" "$bin/uv"
+          export UV_CACHE_DIR="$root/uv-cache" UV_PYTHON_INSTALL_DIR="$root/python" UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1
+          "$bin/uv" python install --quiet 3.12
+          "$bin/uv" venv --quiet --python 3.12 "$root/venv"
+          # shellcheck disable=SC2086
+          VIRTUAL_ENV="$root/venv" "$bin/uv" pip install --quiet "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" $PY_EXTRA
+          rm -rf "$UV_CACHE_DIR"
+          echo "$root/venv/bin" >>"$GITHUB_PATH"
+          # fleet-bundle verifier: self-hosted runners have no Go, so build it with a pinned toolchain under $root.
+          fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256" "$dl/go.tgz"
+          tar -xzf "$dl/go.tgz" -C "$root"
+          GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
+            "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          rm -rf "$root/gocache" "$root/gopath" "$root/go"
+          echo "$bin" >>"$GITHUB_PATH"
 
       - name: Fetch signed platform
         id: platform
@@ -436,7 +487,7 @@ jobs:
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.render.outputs.ready == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest' }}
     environment: fleet-signing
     permissions:
       contents: read
@@ -459,20 +510,43 @@ jobs:
           persist-credentials: false
           token: ${{ secrets.fleet-token }}
 
-      - name: Install tools
+      - name: Install toolchain
+        env:
+          WANT_MINISIGN: "1"
+          PY_EXTRA: ""
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq minisign zstd
-          pip install --disable-pip-version-check "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}"
-          archive="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$RUNNER_TEMP/$archive" \
-            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${archive}"
-          echo "${ORAS_SHA256}  $RUNNER_TEMP/${archive}" | sha256sum --check --quiet
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/bin" oras
-          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
-          go -C .fleet-verifier build -trimpath -o "$RUNNER_TEMP/bin/fleet-bundle" ./cmd/fleet-bundle
+          # Per-job toolchain: pinned, checksum-verified, under RUNNER_TEMP, no sudo (GitHub-hosted and self-hosted
+          # CI_RUNNER runners alike; self-hosted runners must not get system packages from jobs).
+          root="$RUNNER_TEMP/fleet-tools"; bin="$root/bin"; dl="$root/download"; mkdir -p "$bin" "$dl"
+          fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$3" "$1"; echo "$2  $3" | sha256sum -c --quiet -; }
+          command -v zstd >/dev/null || { echo "::error::zstd is missing on the runner (tar --zstd)"; exit 1; }
+          if [ "$WANT_MINISIGN" = 1 ]; then
+            fetch "https://github.com/jedisct1/minisign/releases/download/${MINISIGN_VERSION}/minisign-${MINISIGN_VERSION}-linux.tar.gz" \
+              "$MINISIGN_SHA256" "$dl/minisign.tgz"
+            tar -xzf "$dl/minisign.tgz" -C "$dl" minisign-linux/x86_64/minisign
+            install -m 0755 "$dl/minisign-linux/x86_64/minisign" "$bin/minisign"
+          fi
+          fetch "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
+            "$ORAS_SHA256" "$dl/oras.tgz"
+          tar -xzf "$dl/oras.tgz" -C "$bin" oras
+          fetch "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
+            "$UV_SHA256" "$dl/uv.tgz"
+          tar -xzf "$dl/uv.tgz" -C "$dl" && install -m 0755 "$dl/uv-x86_64-unknown-linux-musl/uv" "$bin/uv"
+          export UV_CACHE_DIR="$root/uv-cache" UV_PYTHON_INSTALL_DIR="$root/python" UV_PYTHON_PREFERENCE=only-managed UV_NO_CONFIG=1
+          "$bin/uv" python install --quiet 3.12
+          "$bin/uv" venv --quiet --python 3.12 "$root/venv"
+          # shellcheck disable=SC2086
+          VIRTUAL_ENV="$root/venv" "$bin/uv" pip install --quiet "PyYAML==${PYYAML_VERSION}" "jsonschema==${JSONSCHEMA_VERSION}" $PY_EXTRA
+          rm -rf "$UV_CACHE_DIR"
+          echo "$root/venv/bin" >>"$GITHUB_PATH"
+          # fleet-bundle verifier: self-hosted runners have no Go, so build it with a pinned toolchain under $root.
+          fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "$GO_SHA256" "$dl/go.tgz"
+          tar -xzf "$dl/go.tgz" -C "$root"
+          GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
+            "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          rm -rf "$root/gocache" "$root/gopath" "$root/go"
+          echo "$bin" >>"$GITHUB_PATH"
 
       - name: Download unsigned bundles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
