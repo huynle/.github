@@ -187,6 +187,8 @@ jobs:
           tar -xzf "$dl/go.tgz" -C "$root"
           GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
             "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          # The module cache is read-only by design; go clean removes it (rm -rf fails with Permission denied).
+          GOPATH="$root/gopath" GOMODCACHE="$root/gopath/pkg/mod" "$root/go/bin/go" clean -modcache
           rm -rf "$root/gocache" "$root/gopath" "$root/go"
           echo "$bin" >>"$GITHUB_PATH"
 
@@ -356,6 +358,8 @@ jobs:
           tar -xzf "$dl/go.tgz" -C "$root"
           GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
             "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          # The module cache is read-only by design; go clean removes it (rm -rf fails with Permission denied).
+          GOPATH="$root/gopath" GOMODCACHE="$root/gopath/pkg/mod" "$root/go/bin/go" clean -modcache
           rm -rf "$root/gocache" "$root/gopath" "$root/go"
           echo "$bin" >>"$GITHUB_PATH"
 
@@ -545,6 +549,8 @@ jobs:
           tar -xzf "$dl/go.tgz" -C "$root"
           GOTOOLCHAIN=local GOPATH="$root/gopath" GOCACHE="$root/gocache" GOMODCACHE="$root/gopath/pkg/mod" \
             "$root/go/bin/go" -C .fleet-verifier build -trimpath -o "$bin/fleet-bundle" ./cmd/fleet-bundle
+          # The module cache is read-only by design; go clean removes it (rm -rf fails with Permission denied).
+          GOPATH="$root/gopath" GOMODCACHE="$root/gopath/pkg/mod" "$root/go/bin/go" clean -modcache
           rm -rf "$root/gocache" "$root/gopath" "$root/go"
           echo "$bin" >>"$GITHUB_PATH"
 
