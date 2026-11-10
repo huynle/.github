@@ -33,8 +33,8 @@ class PlatformFetchWorkflowTests(unittest.TestCase):
         self.assertEqual(step("render", FETCH)["env"]["PLATFORM_REPOSITORY"], "${{ needs.plan.outputs.platform }}")
 
     def test_fetch_happens_after_its_tools_exist_and_before_use(self):
-        for job, tool_step, use_step in (("plan", "Install renderer dependencies", "Find affected machines"),
-                                         ("render", "Install platform fetch tools", "Render")):
+        for job, tool_step, use_step in (("plan", "Install toolchain", "Find affected machines"),
+                                         ("render", "Install toolchain", "Render")):
             names = [c.get("name") for c in JOBS[job]["steps"]]
             self.assertLess(names.index(tool_step), names.index(FETCH), job)
             self.assertLess(names.index(FETCH), names.index(use_step), job)
@@ -60,7 +60,7 @@ class PlatformFetchWorkflowTests(unittest.TestCase):
 
     def test_render_job_has_no_new_permissions_and_checksums_oras(self):
         self.assertEqual(JOBS["render"]["permissions"], {"contents": "read"})
-        tools = step("render", "Install platform fetch tools")["run"]
+        tools = step("render", "Install toolchain")["run"]
         self.assertIn("sha256sum --check", tools)
         self.assertIn("go -C .fleet-verifier build", tools)
         self.assertIn("./cmd/fleet-bundle", tools)
