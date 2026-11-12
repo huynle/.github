@@ -44,7 +44,15 @@ on:
         required: false
         default: true
         type: boolean
+      require-branch-head:
+        description: Branch pushes/workflow_dispatch only; skip publishing unless the caller's branch HEAD still equals the commit being built (tags/PRs fail closed)
+        required: false
+        default: false
+        type: boolean
     outputs:
+      published:
+        description: Whether an image was published (false when the branch-head guard skipped it)
+        value: ${{ jobs.release.outputs.published }}
       digest:
         description: Published image digest
         value: ${{ jobs.release.outputs.digest }}
@@ -70,6 +78,7 @@ jobs:
     # a JSON label list such as ["self-hosted","amos","ci"]; unset, ubuntu-latest. Other values are unchanged v1.
     runs-on: ${{ (inputs.runner == 'ci-runner' || inputs.runner == '') && (vars.CI_RUNNER && fromJSON(vars.CI_RUNNER) || 'ubuntu-latest') || fromJSON(inputs.runner == 'ubuntu-latest' && '"ubuntu-latest"' || inputs.runner == 'github-ci' && '["self-hosted","github-ci"]' || '["self-hosted","amos"]') }}
     outputs:
+      published: ${{ steps.build.outcome == 'success' }}
       digest: ${{ steps.build.outputs.digest }}
       git-tag: ${{ steps.release.outputs.git_tag }}
       sha-tag: ${{ steps.release.outputs.sha_tag }}
@@ -182,7 +191,30 @@ jobs:
           emit("build_args", "\n".join(normalized_args) if normalized_args else " ")
           PY
 
+      - name: Require current branch HEAD
+        id: guard
+        if: inputs.require-branch-head
+        shell: bash
+        env:
+          BRANCH_REF: ${{ github.ref_name }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo 'published=false' >> "$GITHUB_OUTPUT"
+          head="$(git ls-remote --exit-code origin "refs/heads/${BRANCH_REF}" | awk -v ref="refs/heads/${BRANCH_REF}" '$2 == ref { print $1 }')"
+          if [ -z "$head" ]; then
+            echo "::error::Branch ${BRANCH_REF} has no exact HEAD ref; refusing to publish"
+            exit 1
+          fi
+          if [ "$head" != "$EXPECTED_SHA" ]; then
+            echo "::notice::skipped: ${BRANCH_REF} is at ${head}, not ${EXPECTED_SHA}"
+            echo "skipped: ${BRANCH_REF} is at ${head}, not ${EXPECTED_SHA}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo 'published=true' >> "$GITHUB_OUTPUT"
+
       - name: Create immutable release identity
+        if: ${{ !inputs.require-branch-head || steps.guard.outputs.published == 'true' }}
         id: release
         shell: bash
         env:
@@ -195,13 +227,15 @@ jobs:
           echo "sha_tag=sha-${FULL_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        if: contains(steps.validate.outputs.platforms, ',') || steps.validate.outputs.platforms == 'linux/arm64'
+        if: ${{ (!inputs.require-branch-head || steps.guard.outputs.published == 'true') && (contains(steps.validate.outputs.platforms, ',') || steps.validate.outputs.platforms == 'linux/arm64') }}
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.6.0
 
       - name: Set up Docker Buildx
+        if: ${{ !inputs.require-branch-head || steps.guard.outputs.published == 'true' }}
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.11.1
 
       - name: Log in to GHCR with caller token
+        if: ${{ !inputs.require-branch-head || steps.guard.outputs.published == 'true' }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.5.0
         with:
           registry: ghcr.io
@@ -209,6 +243,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate OCI metadata
+        if: ${{ !inputs.require-branch-head || steps.guard.outputs.published == 'true' }}
         id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.8.0
         with:
@@ -222,6 +257,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.release.outputs.git_tag }}
 
       - name: Build and push immutable image
+        if: ${{ !inputs.require-branch-head || steps.guard.outputs.published == 'true' }}
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
         with:
@@ -236,7 +272,7 @@ jobs:
           sbom: ${{ inputs.sbom }}
 
       - name: Publish release summary
-        if: success()
+        if: ${{ success() && (!inputs.require-branch-head || steps.guard.outputs.published == 'true') }}
         shell: bash
         env:
           IMAGE: ${{ steps.validate.outputs.image }}
