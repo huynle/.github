@@ -20,3 +20,4 @@ jobs:
       dockerfile: fixture/app/Dockerfile
       runner: ubuntu-latest
       build-args-json: '{"FIXTURE":"true"}'
+      require-branch-head: true

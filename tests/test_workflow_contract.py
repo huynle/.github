@@ -27,6 +27,55 @@ def step_script(step_name):
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_optional_branch_head_guard_blocks_old_release_before_tagging(self):
+        self.assertRegex(WORKFLOW, r"(?m)^      require-branch-head:\n(?:        .*\n)*?        default: false$")
+        self.assertIn("value: ${{ jobs.release.outputs.published }}", WORKFLOW)
+        self.assertIn("published: ${{ steps.build.outcome == 'success' }}", WORKFLOW)
+        self.assertIn("git ls-remote --exit-code origin", step_script("Require current branch HEAD"))
+        self.assertIn("refs/heads/", step_script("Require current branch HEAD"))
+        self.assertIn("skipped:", step_script("Require current branch HEAD"))
+        guarded = WORKFLOW.split("      - name: Require current branch HEAD", 1)[1]
+        for step in ("Create immutable release identity", "Set up QEMU", "Set up Docker Buildx", "Log in to GHCR with caller token", "Generate OCI metadata", "Build and push immutable image", "Publish release summary"):
+            match = re.search(r"      - name: " + re.escape(step) + r"\n(?P<body>.*?)(?=\n      - name:|\Z)", guarded, re.DOTALL)
+            self.assertIsNotNone(match, step)
+            self.assertIn("steps.guard.outputs.published == 'true'", match.group("body"), step)
+
+    def test_branch_head_guard_matches_or_skips_a_local_branch_without_publishing(self):
+        script = step_script("Require current branch HEAD")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "caller"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "fixture@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "fixture"], check=True)
+            (repo / "README").write_text("first\n")
+            subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "first"], check=True)
+            old = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(repo)], check=True)
+
+            def guard(expected):
+                output, summary = Path(tmp) / "output", Path(tmp) / "summary"
+                output.write_text("")
+                summary.write_text("")
+                result = subprocess.run(["bash", "-c", script], cwd=repo, capture_output=True, text=True,
+                    env={"PATH": "/usr/bin:/bin", "BRANCH_REF": "main", "EXPECTED_SHA": expected,
+                         "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return output.read_text(), summary.read_text(), result.stdout
+
+            emitted, summary, notice = guard(old)
+            self.assertIn("published=true", emitted)
+            self.assertEqual(summary, "")
+            self.assertNotIn("skipped:", notice)
+            (repo / "README").write_text("new\n")
+            subprocess.run(["git", "-C", str(repo), "commit", "-qam", "new"], check=True)
+            emitted, summary, notice = guard(old)
+            self.assertIn("published=false", emitted)
+            self.assertIn("skipped: main is at", summary)
+            self.assertIn(old, summary)
+            self.assertIn("::notice::skipped:", notice)
+
     def test_actions_are_pinned_to_full_commit_shas(self):
         uses = re.findall(r"uses:\s+([^\s#]+)", WORKFLOW + "\n" + FIXTURE + "\n" + LIVE_FIXTURE)
         remote = [value for value in uses if not value.startswith("./") and not value.startswith("huynle/.github/")]
