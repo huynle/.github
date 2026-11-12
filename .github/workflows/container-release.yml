@@ -45,7 +45,7 @@ on:
         default: true
         type: boolean
       require-branch-head:
-        description: Skip publishing unless the caller's branch HEAD still equals the commit being built
+        description: Branch pushes/workflow_dispatch only; skip publishing unless the caller's branch HEAD still equals the commit being built (tags/PRs fail closed)
         required: false
         default: false
         type: boolean
@@ -201,7 +201,11 @@ jobs:
         run: |
           set -euo pipefail
           echo 'published=false' >> "$GITHUB_OUTPUT"
-          head="$(git ls-remote --exit-code origin "refs/heads/${BRANCH_REF}" | cut -f1)"
+          head="$(git ls-remote --exit-code origin "refs/heads/${BRANCH_REF}" | awk -v ref="refs/heads/${BRANCH_REF}" '$2 == ref { print $1 }')"
+          if [ -z "$head" ]; then
+            echo "::error::Branch ${BRANCH_REF} has no exact HEAD ref; refusing to publish"
+            exit 1
+          fi
           if [ "$head" != "$EXPECTED_SHA" ]; then
             echo "::notice::skipped: ${BRANCH_REF} is at ${head}, not ${EXPECTED_SHA}"
             echo "skipped: ${BRANCH_REF} is at ${head}, not ${EXPECTED_SHA}" >> "$GITHUB_STEP_SUMMARY"

@@ -68,6 +68,12 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn("published=true", emitted)
             self.assertEqual(summary, "")
             self.assertNotIn("skipped:", notice)
+            # ls-remote's pattern is a suffix match; a decoy ref must not override the exact branch HEAD.
+            subprocess.run(["git", "-C", str(repo), "branch", "x/refs/heads/main"], check=True)
+            emitted, summary, notice = guard(old)
+            self.assertIn("published=true", emitted)
+            self.assertEqual(summary, "")
+            self.assertNotIn("skipped:", notice)
             (repo / "README").write_text("new\n")
             subprocess.run(["git", "-C", str(repo), "commit", "-qam", "new"], check=True)
             emitted, summary, notice = guard(old)
